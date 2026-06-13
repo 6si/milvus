@@ -2226,22 +2226,7 @@ func normalizePositionTimestamp(pos *msgpb.MsgPosition, commitTs uint64) *msgpb.
 	}
 }
 
-func validateCompactionFallbackStartPosition(compactFromSegInfos []*SegmentInfo, fallbackStart *msgpb.MsgPosition) error {
-	if fallbackStart == nil {
-		return nil
-	}
-	var maxCommitTs uint64
-	for _, info := range compactFromSegInfos {
-		maxCommitTs = max(maxCommitTs, info.GetCommitTimestamp())
-	}
-	if maxCommitTs == 0 || fallbackStart.GetTimestamp() >= maxCommitTs {
-		return nil
-	}
-	return errors.Errorf(
-		"compaction fallback start position timestamp %d is earlier than max input commit timestamp %d",
-		fallbackStart.GetTimestamp(),
-		maxCommitTs)
-}
+
 
 func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, result *datapb.CompactionPlanResult) ([]*SegmentInfo, *segMetricMutation, error) {
 	log := log.Ctx(context.TODO()).With(zap.Int64("planID", t.GetPlanID()),
@@ -2282,15 +2267,17 @@ func (m *meta) completeClusterCompactionMutation(t *datapb.CompactionTask, resul
 	// binlogs are already rewritten to commit_ts by the compactor, so
 	// recalculateSegmentPosition will pick up commit_ts from output binlogs.
 	// The fallback start position must not be earlier than any input import
-	// segment's commit_ts. The check below pins that invariant so a future
-	// change to sort-compaction position handling cannot silently expose
-	// compacted import rows too early.
+	// segment's commit_ts. Normalize the position upward to pin that invariant
+	// (rather than rejecting the compaction) so bulk-imported segments compact
+	// successfully even when StartPosition < CommitTimestamp.
 	fallbackStart := getMinPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 		return info.GetStartPosition()
 	}))
-	if err := validateCompactionFallbackStartPosition(compactFromSegInfos, fallbackStart); err != nil {
-		return nil, nil, err
+	var maxCommitTs uint64
+	for _, info := range compactFromSegInfos {
+		maxCommitTs = max(maxCommitTs, info.GetCommitTimestamp())
 	}
+	fallbackStart = normalizePositionTimestamp(fallbackStart, maxCommitTs)
 	fallbackDml := getMaxPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 		return info.GetDmlPosition()
 	}))
@@ -2410,15 +2397,17 @@ func (m *meta) completeMixCompactionMutation(
 	// output segment is a normal segment with CommitTimestamp = 0.
 	// recalculateSegmentPosition will pick up commit_ts from output binlogs.
 	// The fallback start position must not be earlier than any input import
-	// segment's commit_ts. The check below pins that invariant so a future
-	// change to sort-compaction position handling cannot silently expose
-	// compacted import rows too early.
+	// segment's commit_ts. Normalize the position upward to pin that invariant
+	// (rather than rejecting the compaction) so bulk-imported segments compact
+	// successfully even when StartPosition < CommitTimestamp.
 	fallbackStart := getMinPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 		return info.GetStartPosition()
 	}))
-	if err := validateCompactionFallbackStartPosition(compactFromSegInfos, fallbackStart); err != nil {
-		return nil, nil, err
+	var maxCommitTs uint64
+	for _, info := range compactFromSegInfos {
+		maxCommitTs = max(maxCommitTs, info.GetCommitTimestamp())
 	}
+	fallbackStart = normalizePositionTimestamp(fallbackStart, maxCommitTs)
 	fallbackDml := getMaxPosition(lo.Map(compactFromSegInfos, func(info *SegmentInfo, _ int) *msgpb.MsgPosition {
 		return info.GetDmlPosition()
 	}))
