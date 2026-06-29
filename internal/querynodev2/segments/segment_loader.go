@@ -262,6 +262,19 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	var err error
 	var requestResourceResult requestResourceResult
 
+	// Apply override_index_type before resource estimation so GPU_HNSW's
+	// StaticEstimateLoadResource (memoryCost=0) is used instead of the
+	// default HNSW estimate (memoryCost=file_size).
+	for _, info := range infos {
+		for _, indexInfo := range info.IndexInfos {
+			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+				return nil, err
+			}
+			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
+		}
+	}
+
 	// Check memory & storage limit
 	// no need to check resource for lazy load here
 	requestResourceResult, err = loader.requestResource(ctx, infos...)
