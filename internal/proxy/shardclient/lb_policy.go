@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -370,20 +371,25 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 	log := log.Ctx(ctx).With(
 		zap.Int64("collectionID", workload.CollectionID),
 	)
+	shardLeaderStart := time.Now()
 	channelList, err := lb.GetShardLeaderList(ctx, workload.Db, workload.CollectionName, workload.CollectionID, true)
 	if err != nil {
 		log.Warn("failed to get shards", zap.Error(err))
 		return err
 	}
+	log.Info("GPU_TIMING lb_get_shard_leaders",
+		zap.Duration("duration", time.Since(shardLeaderStart)),
+		zap.Int("num_channels", len(channelList)))
 
 	if len(channelList) == 0 {
 		log.Info("no shard leaders found", zap.Int64("collectionID", workload.CollectionID))
 		return merr.WrapErrCollectionNotLoaded(workload.CollectionID)
 	}
 
+	fanOutStart := time.Now()
 	// Single channel fast path: skip errgroup/goroutine overhead
 	if len(channelList) == 1 {
-		return lb.ExecuteWithRetry(ctx, ChannelWorkload{
+		err := lb.ExecuteWithRetry(ctx, ChannelWorkload{
 			Db:              workload.Db,
 			CollectionName:  workload.CollectionName,
 			CollectionID:    workload.CollectionID,
@@ -392,6 +398,10 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			Exec:            workload.Exec,
 			PreferredNodeID: preferredNodeID(workload, channelList[0]),
 		})
+		log.Info("GPU_TIMING lb_fan_out",
+			zap.Duration("duration", time.Since(fanOutStart)),
+			zap.Int("num_channels", 1))
+		return err
 	}
 
 	wg, _ := errgroup.WithContext(ctx)
@@ -408,7 +418,11 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			})
 		})
 	}
-	return wg.Wait()
+	err = wg.Wait()
+	log.Info("GPU_TIMING lb_fan_out",
+		zap.Duration("duration", time.Since(fanOutStart)),
+		zap.Int("num_channels", len(channelList)))
+	return err
 }
 
 // ExecuteOneChannel will execute at any one channel in collection

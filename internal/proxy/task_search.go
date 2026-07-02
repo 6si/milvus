@@ -156,6 +156,7 @@ func (t *searchTask) CanSkipAllocTimestamp() bool {
 }
 
 func (t *searchTask) PreExecute(ctx context.Context) error {
+	preExecStart := time.Now()
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-PreExecute")
 	defer sp.End()
 
@@ -359,6 +360,9 @@ func (t *searchTask) PreExecute(ctx context.Context) error {
 		zap.Any("consistency level", consistencyLevel),
 		zap.Uint64("timeout_ts", t.GetTimeoutTimestamp()),
 		zap.Uint64("collection_ttl_timestamps", t.CollectionTtlTimestamps))
+	log.Info("GPU_TIMING proxy_pre_execute",
+		zap.Duration("duration", time.Since(preExecStart)),
+		zap.Int64("nq", t.Nq))
 	return nil
 }
 
@@ -1135,6 +1139,7 @@ func (t *searchTask) tryParsePartitionIDsFromPlan(plan *planpb.PlanNode) ([]int6
 }
 
 func (t *searchTask) Execute(ctx context.Context) error {
+	execStart := time.Now()
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-Execute")
 	defer sp.End()
 	log := log.Ctx(ctx).WithLazy(zap.Int64("nq", t.GetNq()))
@@ -1155,6 +1160,9 @@ func (t *searchTask) Execute(ctx context.Context) error {
 		return errors.Wrap(err, "failed to search")
 	}
 
+	log.Info("GPU_TIMING proxy_execute",
+		zap.Duration("duration", time.Since(execStart)),
+		zap.Int64("collection", t.GetCollectionID()))
 	log.Debug("Search Execute done.",
 		zap.Int64("collection", t.GetCollectionID()),
 		zap.Int64s("partitionIDs", t.GetPartitionIDs()))
@@ -1218,6 +1226,7 @@ func validateElementFilterVectorSearch(plan *planpb.PlanNode, schema *schemapb.C
 }
 
 func (t *searchTask) PostExecute(ctx context.Context) error {
+	postExecStart := time.Now()
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-Search-PostExecute")
 	defer sp.End()
 
@@ -1333,6 +1342,9 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 		t.result.SessionTs = getMaxMvccTsFromChannels(t.queryChannelsTs, t.BeginTs())
 	}
 
+	log.Info("GPU_TIMING proxy_post_execute",
+		zap.Duration("duration", time.Since(postExecStart)),
+		zap.Int64("nq", t.GetNq()))
 	metrics.ProxyReduceResultLatency.WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), metrics.SearchLabel).Observe(float64(tr.RecordSpan().Microseconds()) / 1000.0)
 
 	timeFields := parseTimeFields(t.request.SearchParams)
@@ -1370,6 +1382,7 @@ func (t *searchTask) PostExecute(ctx context.Context) error {
 }
 
 func (t *searchTask) searchShard(ctx context.Context, nodeID int64, qn types.QueryNodeClient, channel string) error {
+	shardStart := time.Now()
 	ctx = retry.WithMaxAttemptsContext(ctx, 1)
 	searchReq := shallowcopy.ShallowCopySearchRequest(t.SearchRequest, nodeID)
 	req := &querypb.SearchRequest{
@@ -1412,6 +1425,10 @@ func (t *searchTask) searchShard(ctx context.Context, nodeID int64, qn types.Que
 	}
 	t.lb.UpdateCostMetrics(nodeID, result.CostAggregation)
 
+	log.Ctx(ctx).Info("GPU_TIMING proxy_search_shard",
+		zap.Duration("duration", time.Since(shardStart)),
+		zap.Int64("nodeID", nodeID),
+		zap.String("channel", channel))
 	return nil
 }
 
