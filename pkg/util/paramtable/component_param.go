@@ -26,12 +26,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/shirou/gopsutil/v3/disk"
+	"github.com/shirou/gopsutil/v4/disk"
 	"go.uber.org/atomic"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/pkg/v3/config"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util/fips"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/hardware"
@@ -42,7 +41,7 @@ import (
 const (
 	// DefaultIndexSliceSize defines the default slice size of index file when serializing.
 	DefaultIndexSliceSize                      = 16
-	DefaultStreamBudgetRatio                   = 3.0
+	DefaultLoadTransientBudgetBytes            = 0
 	DefaultGracefulTime                        = 5000 // ms
 	DefaultGracefulStopTimeout                 = 1800 // s, for node
 	DefaultProxyGracefulStopTimeout            = 30   // s，for proxy
@@ -50,7 +49,6 @@ const (
 	DefaultHighPriorityThreadCoreCoefficient   = 10
 	DefaultMiddlePriorityThreadCoreCoefficient = 5
 	DefaultLowPriorityThreadCoreCoefficient    = 1
-	DefaultBM25LoadThreadCoreCoefficient       = 1
 	DefaultThreadPoolMaxThreadsSize            = 16
 
 	DefaultSessionTTL        = 15 // s
@@ -131,7 +129,7 @@ func (p *ComponentParam) init(bt *BaseTable) {
 
 	p.CommonCfg.init(bt)
 	if fips.MaybeEnableOpenSSLFIPS() && !p.MinioCfg.UseCRC32C.GetAsBool() {
-		log.Warn("FIPS mode requires CRC32C checksum for S3 PutObject requests; override minio.ssl.useCRC32C to true at runtime")
+		mlog.Warn(context.TODO(), "FIPS mode requires CRC32C checksum for S3 PutObject requests; override minio.ssl.useCRC32C to true at runtime")
 		p.MinioCfg.UseCRC32C.SwapTempValue("true")
 	}
 	p.QuotaConfig.init(bt)
@@ -233,11 +231,10 @@ type commonConfig struct {
 	DefaultIndexName     ParamItem `refreshable:"true"`
 
 	IndexSliceSize                      ParamItem `refreshable:"false"`
-	StreamBudgetRatio                   ParamItem `refreshable:"true"`
+	LoadTransientBudgetBytes            ParamItem `refreshable:"true"`
 	HighPriorityThreadCoreCoefficient   ParamItem `refreshable:"true"`
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
-	BM25LoadThreadCoreCoefficient       ParamItem `refreshable:"true"`
 	ThreadPoolMaxThreadsSize            ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolCoefficient        ParamItem `refreshable:"true"`
 	ArrowIOThreadPoolMaxCapacity        ParamItem `refreshable:"true"`
@@ -277,6 +274,7 @@ type commonConfig struct {
 	RootShouldBindRole    ParamItem `refreshable:"true"`
 	EnablePublicPrivilege ParamItem `refreshable:"false"`
 	ExprEnabled           ParamItem `refreshable:"false"`
+	ExprAuthMode          ParamItem `refreshable:"false"`
 
 	ClusterName ParamItem `refreshable:"false"`
 
@@ -558,14 +556,27 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 	}
 	p.IndexSliceSize.Init(base.mgr)
 
-	p.StreamBudgetRatio = ParamItem{
-		Key:          "common.entryStream.streamBudgetRatio",
+	p.LoadTransientBudgetBytes = ParamItem{
+		Key:          "common.loadTransientBudgetBytes",
 		Version:      "3.0.0",
-		DefaultValue: fmt.Sprintf("%f", DefaultStreamBudgetRatio),
-		Doc:          "Multiplier for entry stream transient memory budget, relative to CPU core count",
-		Export:       true,
+		DefaultValue: strconv.Itoa(DefaultLoadTransientBudgetBytes),
+		Doc: `Process-wide transient memory budget in bytes shared by scalar ` +
+			`index V3 entry streaming and storage v2/v3 field-data loading. It gates ` +
+			`in-flight transient data across concurrent load tasks. Lower ` +
+			`values reduce peak transient memory at the cost of load throughput. ` +
+			`Oversized requests are still allowed to proceed exclusively to ` +
+			`guarantee progress. Set to 0 to disable the limit.`,
+		Export: true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) < 0 {
+				mlog.Warn(context.TODO(), "common.loadTransientBudgetBytes must be non-negative, using unlimited",
+					mlog.String("configured", v))
+				return strconv.Itoa(DefaultLoadTransientBudgetBytes)
+			}
+			return v
+		},
 	}
-	p.StreamBudgetRatio.Init(base.mgr)
+	p.LoadTransientBudgetBytes.Init(base.mgr)
 
 	p.EnableMaterializedView = ParamItem{
 		Key:          "common.materializedView.enabled",
@@ -705,16 +716,6 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export: true,
 	}
 	p.LowPriorityThreadCoreCoefficient.Init(base.mgr)
-
-	p.BM25LoadThreadCoreCoefficient = ParamItem{
-		Key:          "common.threadCoreCoefficient.bm25Load",
-		Version:      "2.6.8",
-		DefaultValue: strconv.Itoa(DefaultBM25LoadThreadCoreCoefficient),
-		Doc: "This parameter specify how many times the number of threads " +
-			"is the number of cores in BM25 load pool",
-		Export: true,
-	}
-	p.BM25LoadThreadCoreCoefficient.Init(base.mgr)
 
 	p.ThreadPoolMaxThreadsSize = ParamItem{
 		Key:          "common.threadCoreCoefficient.maxThreadsSize",
@@ -934,10 +935,21 @@ Large numeric passwords require double quotes to avoid yaml parsing precision is
 		Key:          "common.security.exprEnabled",
 		Version:      "2.6.0",
 		DefaultValue: "false",
-		Doc:          "Whether to enable the /expr endpoint for debugging. When enabled, only root user can access it via HTTP Basic Auth on Proxy nodes.",
+		Doc:          "Whether to enable the /expr endpoint for debugging.",
 		Export:       true,
 	}
 	p.ExprEnabled.Init(base.mgr)
+
+	p.ExprAuthMode = ParamItem{
+		Key:          "common.security.exprAuthMode",
+		Version:      "2.6.0",
+		DefaultValue: "rootOnly",
+		Doc: "Authentication mode for the /expr endpoint. Valid values: rootOnly, rbac. " +
+			"rootOnly accepts only the root credentials via HTTP Basic Auth. " +
+			"rbac requires common.security.authorizationEnabled=true and grants access to any user holding the Expr privilege.",
+		Export: true,
+	}
+	p.ExprAuthMode.Init(base.mgr)
 
 	p.ClusterName = ParamItem{
 		Key:          "common.cluster.name",
@@ -3563,6 +3575,7 @@ type queryNodeConfig struct {
 	TieredLoadingTimeoutMs          ParamItem `refreshable:"true"`
 	TieredWarmupLoadingTimeoutMs    ParamItem `refreshable:"true"`
 	StorageUsageTrackingEnabled     ParamItem `refreshable:"true"`
+	TieredRejectRemoteVectorOutput  ParamItem `refreshable:"true"`
 
 	KnowhereScoreConsistency ParamItem `refreshable:"false"`
 
@@ -3643,6 +3656,19 @@ type queryNodeConfig struct {
 	// CGOPoolSize ratio to MaxReadConcurrency
 	CGOPoolSizeRatio ParamItem `refreshable:"true"`
 
+	// MutatePoolSizeFactor controls the size of the online-write CGO pool
+	// (segment Insert/Delete) as CPUNum * factor. The mutate pool is isolated
+	// from load/management work so segment loading cannot starve online writes.
+	MutatePoolSizeFactor ParamItem `refreshable:"true"`
+
+	// DynamicPoolSizeFactor controls the size of the dynamic CGO pool
+	// (segment create/release/statistics/index-info) as CPUNum * factor.
+	DynamicPoolSizeFactor ParamItem `refreshable:"true"`
+
+	// DeletePoolSizeFactor controls the size of the DeleteBatch dispatch pool
+	// as CPUNum * factor.
+	DeletePoolSizeFactor ParamItem `refreshable:"true"`
+
 	// Target average byte size per storage v2 cache cell. Parquet row groups
 	// are packed into cells so rgs_per_cell * avg_rg_size ≈ this value.
 	StorageV2CellTargetSizeBytes ParamItem `refreshable:"true"`
@@ -3671,6 +3697,7 @@ type queryNodeConfig struct {
 	CleanExcludeSegInterval ParamItem `refreshable:"false"`
 	FlowGraphMaxQueueLength ParamItem `refreshable:"false"`
 	FlowGraphMaxParallelism ParamItem `refreshable:"false"`
+	DMLMicroBatchMaxMsgNum  ParamItem `refreshable:"true"`
 
 	MemoryIndexLoadPredictMemoryUsageFactor ParamItem `refreshable:"true"`
 	EnableSegmentPrune                      ParamItem `refreshable:"true"`
@@ -3771,6 +3798,15 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.FlowGraphMaxParallelism.Init(base.mgr)
+
+	p.DMLMicroBatchMaxMsgNum = ParamItem{
+		Key:          "queryNode.dataSync.dmlMicroBatch.maxMsgNum",
+		Version:      "3.0.0",
+		DefaultValue: "8",
+		Doc:          "Maximum number of DML messages in one micro-batch drained by query node data sync pipeline. The batcher only drains already buffered messages and does not wait for more messages.",
+		Export:       true,
+	}
+	p.DMLMicroBatchMaxMsgNum.Init(base.mgr)
 
 	p.StatsPublishInterval = ParamItem{
 		Key:          "queryNode.stats.publishInterval",
@@ -4020,6 +4056,15 @@ If set to 0, time based eviction is disabled.`,
 		Export:       true,
 	}
 	p.StorageUsageTrackingEnabled.Init(base.mgr)
+
+	p.TieredRejectRemoteVectorOutput = ParamItem{
+		Key:          "queryNode.segcore.tieredStorage.rejectRemoteVectorOutput",
+		Version:      "3.0.0",
+		DefaultValue: "false",
+		Doc:          "When true, search/query fails instead of loading remote vector field data for output fields that are not already cached in local memory or disk.",
+		Export:       false,
+	}
+	p.TieredRejectRemoteVectorOutput.Init(base.mgr)
 
 	p.TieredLoadingResourceFactor = ParamItem{
 		Key:          "queryNode.segcore.tieredStorage.loadingResourceFactor",
@@ -4499,7 +4544,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "64",
 		Export:       true,
 	}
 	p.MaxGroupNQ.Init(base.mgr)
@@ -4507,7 +4552,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.NQMergeRatio = ParamItem{
 		Key:          "queryNode.grouping.nqMergeRatio",
 		Version:      "2.6.17",
-		DefaultValue: "3.0",
+		DefaultValue: "16.0",
 		Doc:          "Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.",
 		Export:       true,
 	}
@@ -4579,12 +4624,12 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 				localStoragePath := getLocalStoragePath(base)
 				if _, err := os.Stat(localStoragePath); os.IsNotExist(err) {
 					if err := os.MkdirAll(localStoragePath, os.ModePerm); err != nil {
-						log.Fatal("failed to mkdir", zap.String("localStoragePath", localStoragePath), zap.Error(err))
+						mlog.Fatal(context.TODO(), "failed to mkdir", mlog.String("localStoragePath", localStoragePath), mlog.Err(err))
 					}
 				}
 				diskUsage, err := disk.Usage(localStoragePath)
 				if err != nil {
-					log.Fatal("failed to get disk usage", zap.String("localStoragePath", localStoragePath), zap.Error(err))
+					mlog.Fatal(context.TODO(), "failed to get disk usage", mlog.String("localStoragePath", localStoragePath), mlog.Err(err))
 				}
 				return strconv.FormatUint(diskUsage.Total, 10)
 			}
@@ -4806,6 +4851,33 @@ user-task-polling:
 	}
 	p.CGOPoolSizeRatio.Init(base.mgr)
 
+	p.MutatePoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.mutatePoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "2",
+		Doc:          "size factor (CPUNum * factor) of the online-write cgo pool for segment insert/delete; isolated from the load/management pool so segment loading cannot starve online writes",
+		Export:       true,
+	}
+	p.MutatePoolSizeFactor.Init(base.mgr)
+
+	p.DynamicPoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.dynamicPoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "1",
+		Doc:          "size factor (CPUNum * factor) of the dynamic cgo pool for segment create/release/statistics/index-info",
+		Export:       true,
+	}
+	p.DynamicPoolSizeFactor.Init(base.mgr)
+
+	p.DeletePoolSizeFactor = ParamItem{
+		Key:          "queryNode.segcore.deletePoolSizeFactor",
+		Version:      "3.0.0",
+		DefaultValue: "1",
+		Doc:          "size factor (CPUNum * factor) of the DeleteBatch dispatch pool",
+		Export:       true,
+	}
+	p.DeletePoolSizeFactor.Init(base.mgr)
+
 	p.StorageV2CellTargetSizeBytes = ParamItem{
 		Key:          "queryNode.segcore.storageV2.cellTargetSizeBytes",
 		Version:      "3.0.0",
@@ -4818,8 +4890,8 @@ user-task-polling:
 		Export: true,
 		Formatter: func(v string) string {
 			if getAsInt64(v) <= 0 {
-				log.Warn("queryNode.segcore.storageV2.cellTargetSizeBytes must be positive, using default 4 MiB",
-					zap.String("configured", v))
+				mlog.Warn(context.TODO(), "queryNode.segcore.storageV2.cellTargetSizeBytes must be positive, using default 4 MiB",
+					mlog.String("configured", v))
 				return "4194304"
 			}
 			return v
@@ -6558,10 +6630,12 @@ if param targetScalarIndexVersion is not set, the default value is -1, which mea
 	p.ExternalCollectionDropRatioWarn.Init(base.mgr)
 
 	p.ExternalCollectionPreAllocSegments = ParamItem{
-		Key:          "dataCoord.externalCollectionPreAllocSegments",
-		Version:      "2.6.8",
-		Doc:          "The number of IDs to pre-allocate for each external collection refresh task. Each segment consumes 2 IDs (1 for segment, 1 for fake binlog logID).",
-		DefaultValue: "10000",
+		Key:     "dataCoord.externalCollectionPreAllocSegments",
+		Version: "2.6.8",
+		Doc: "The number of IDs to pre-allocate for each external collection refresh task. " +
+			"Each segment consumes 2 IDs (1 for segment, 1 for fake binlog logID); " +
+			"milvus-table deltalogs without LogID consume additional fallback IDs.",
+		DefaultValue: "500000",
 		PanicIfEmpty: false,
 	}
 	p.ExternalCollectionPreAllocSegments.Init(base.mgr)
@@ -6956,7 +7030,7 @@ func (p *dataNodeConfig) init(base *BaseTable) {
 		Formatter: func(v string) string {
 			concurrency := getAsInt(v)
 			if concurrency < 1 {
-				log.Warn("positive parallel task number, reset to default 16", zap.String("value", v))
+				mlog.Warn(context.TODO(), "positive parallel task number, reset to default 16", mlog.String("value", v))
 				return "16" // MaxParallelSyncMgrTasksPerCPUCore must >= 1
 			}
 			return strconv.FormatInt(int64(concurrency), 10)
@@ -7014,7 +7088,7 @@ Setting this parameter too small causes the system to store a small amount of da
 			Export:       true,
 		}
 	} else {
-		log.Info("DeployModeEnv is not set, use default", zap.Float64("default", 0.5))
+		mlog.Info(context.TODO(), "DeployModeEnv is not set, use default", mlog.Float64("default", 0.5))
 		p.MemoryForceSyncWatermark = ParamItem{
 			Key:          "dataNode.memory.forceSyncWatermark",
 			Version:      "2.4.0",
@@ -7060,7 +7134,9 @@ Setting this parameter too small causes the system to store a small amount of da
 	p.IOConcurrency = ParamItem{
 		Key:          "dataNode.dataSync.ioConcurrency",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "0",
+		Doc:          "Concurrency of the datanode object-storage I/O pool (download/upload for compaction and stats tasks). 0 or negative means auto (CPU*2).",
+		Export:       true,
 	}
 	p.IOConcurrency.Init(base.mgr)
 
@@ -7206,7 +7282,7 @@ if this parameter <= 0, will set it as 10`,
 		Formatter: func(v string) string {
 			percentage := getAsFloat(v)
 			if percentage <= 0 || percentage > 100 {
-				log.Warn("invalid import memory limit percentage, using default 10%")
+				mlog.Warn(context.TODO(), "invalid import memory limit percentage, using default 10%")
 				return "10"
 			}
 			return fmt.Sprintf("%f", percentage)
@@ -8279,7 +8355,7 @@ func getLocalStoragePath(base *BaseTable) string {
 	localStoragePath := base.Get("localStorage.path")
 	if len(localStoragePath) == 0 {
 		localStoragePath = defaultLocalStoragePath
-		log.Warn("localStorage.path is not set, using default value", zap.String("localStorage.path", localStoragePath))
+		mlog.Warn(context.TODO(), "localStorage.path is not set, using default value", mlog.String("localStorage.path", localStoragePath))
 	}
 	return localStoragePath
 }

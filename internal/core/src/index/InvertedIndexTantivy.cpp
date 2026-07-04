@@ -616,8 +616,7 @@ InvertedIndexTantivy<T>::BuildWithRawDataForUT(size_t n,
                 }
             } else {
                 for (size_t i = 0; i < n; i++) {
-                    wrapper_->template add_array_data(
-                        arr[i].data(), arr[i].size(), i);
+                    wrapper_->add_array_data(arr[i].data(), arr[i].size(), i);
                 }
             }
         } else {
@@ -628,7 +627,7 @@ InvertedIndexTantivy<T>::BuildWithRawDataForUT(size_t n,
             // only used in ut.
             auto arr = static_cast<const boost::container::vector<T>*>(values);
             for (size_t i = 0; i < n; i++) {
-                wrapper_->template add_array_data_by_single_segment_writer(
+                wrapper_->add_array_data_by_single_segment_writer(
                     arr[i].data(), arr[i].size());
             }
         } else {
@@ -752,13 +751,12 @@ InvertedIndexTantivy<T>::build_index_for_array(
             }
             auto length = data->is_valid(i) ? array_column[i].length() : 0;
             if (!inverted_index_single_segment_) {
-                wrapper_->template add_array_data(
-                    reinterpret_cast<const ElementType*>(
-                        array_column[i].data()),
-                    length,
-                    offset++);
+                wrapper_->add_array_data(reinterpret_cast<const ElementType*>(
+                                             array_column[i].data()),
+                                         length,
+                                         offset++);
             } else {
-                wrapper_->template add_array_data_by_single_segment_writer(
+                wrapper_->add_array_data_by_single_segment_writer(
                     reinterpret_cast<const ElementType*>(
                         array_column[i].data()),
                     length);
@@ -792,11 +790,10 @@ InvertedIndexTantivy<std::string>::build_index_for_array(
             }
             auto length = data->is_valid(i) ? output.size() : 0;
             if (!inverted_index_single_segment_) {
-                wrapper_->template add_array_data(
-                    output.data(), length, offset++);
+                wrapper_->add_array_data(output.data(), length, offset++);
             } else {
-                wrapper_->template add_array_data_by_single_segment_writer(
-                    output.data(), length);
+                wrapper_->add_array_data_by_single_segment_writer(output.data(),
+                                                                  length);
             }
         }
     }
@@ -815,16 +812,18 @@ InvertedIndexTantivy<T>::build_index_for_array_nested(
     int64_t row_offset = 0;
     for (const auto& data : field_datas) {
         auto n = data->get_num_rows();
-        auto array_column = static_cast<const Array*>(data->Data());
         for (int64_t i = 0; i < n; i++, row_offset++) {
             if (schema_.nullable() && !data->is_valid(i)) {
                 // Record null row offset, no elements to add
                 null_offset_.push_back(row_offset);
                 continue;
             }
-            auto length = array_column[i].length();
+            // RawValue maps logical->physical so compact nullable array
+            // FieldData is read correctly (Data()[i] would overrun).
+            auto* array = reinterpret_cast<const Array*>(data->RawValue(i));
+            auto length = array->length();
             wrapper_->template add_data<ElementType>(
-                reinterpret_cast<const ElementType*>(array_column[i].data()),
+                reinterpret_cast<const ElementType*>(array->data()),
                 length,
                 offset);
             offset += length;
@@ -841,22 +840,23 @@ InvertedIndexTantivy<std::string>::build_index_for_array_nested(
     std::vector<std::string> output;
     for (const auto& data : field_datas) {
         auto n = data->get_num_rows();
-        auto array_column = static_cast<const Array*>(data->Data());
         for (int64_t i = 0; i < n; i++, row_offset++) {
             if (schema_.nullable() && !data->is_valid(i)) {
                 // Record null row offset, no elements to add
                 null_offset_.push_back(row_offset);
                 continue;
             }
-            Assert(IsStringDataType(array_column[i].get_element_type()));
+            // RawValue maps logical->physical so compact nullable array
+            // FieldData is read correctly (Data()[i] would overrun).
+            auto* array = reinterpret_cast<const Array*>(data->RawValue(i));
+            Assert(IsStringDataType(array->get_element_type()));
             Assert(IsStringDataType(
                 static_cast<DataType>(schema_.element_type())));
 
             output.clear();
-            auto length = array_column[i].length();
+            auto length = array->length();
             for (int64_t j = 0; j < length; j++) {
-                output.push_back(
-                    array_column[i].template get_data<std::string>(j));
+                output.push_back(array->get_data<std::string>(j));
             }
             wrapper_->add_data(output.data(), length, offset);
             offset += length;

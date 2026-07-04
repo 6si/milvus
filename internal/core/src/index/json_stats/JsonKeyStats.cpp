@@ -30,9 +30,6 @@
 #include "NamedType/underlying_functionalities.hpp"
 #include "arrow/api.h"
 #include "boost/filesystem/operations.hpp"
-#include "bsoncxx/builder/basic/document.hpp"
-#include "bsoncxx/document/value.hpp"
-#include "bsoncxx/document/view.hpp"
 #include "cachinglayer/Manager.h"
 #include "cachinglayer/Translator.h"
 #include "common/Consts.h"
@@ -81,7 +78,8 @@ JsonKeyStats::JsonKeyStats(const storage::FileManagerContext& ctx,
                            double json_stats_shredding_ratio_threshold,
                            int64_t json_stats_write_batch_size,
                            uint32_t tantivy_index_version)
-    : ScalarIndex<std::string>(JSON_KEY_STATS_INDEX_TYPE) {
+    : ScalarIndex<std::string>(JSON_KEY_STATS_INDEX_TYPE),
+      file_manager_context_(ctx) {
     schema_ = ctx.fieldDataMeta.field_schema;
     field_id_ = ctx.fieldDataMeta.field_id;
     segment_id_ = ctx.fieldDataMeta.segment_id;
@@ -516,10 +514,8 @@ JsonKeyStats::BuildKeyStatsForNullRow() {
     }
 
     // add null bson to shared column
-    bsoncxx::builder::basic::document null_doc;
-    auto null_bson = null_doc.extract();
-    parquet_writer_->AppendSharedRow(null_bson.view().data(),
-                                     null_bson.view().length());
+    BsonDocument null_doc;
+    parquet_writer_->AppendSharedRow(null_doc.data(), null_doc.length());
 
     parquet_writer_->AddCurrentRow();
 }
@@ -595,12 +591,13 @@ JsonKeyStats::BuildKeyStatsForRow(const char* json_str, uint32_t row_id) {
         }
     }
 
-    bsoncxx::builder::basic::document final_doc;
-    BsonBuilder::ConvertDomToBson(root, final_doc);
+    BsonDocument final_doc;
+    BsonBuilder::ConvertDomToBson(root, final_doc.get());
     // build inverted index for shared key
     // cache pairs of (key, row_id/offset) into memory
     // when all rows processed, build it into disk
-    auto key_offsets = BsonBuilder::ExtractBsonKeyOffsets(final_doc.view());
+    auto key_offsets = BsonBuilder::ExtractBsonKeyOffsets(final_doc.data(),
+                                                          final_doc.length());
     for (const auto& [key, offset] : key_offsets) {
         LOG_TRACE(
             "add record to bson inverted index: {} with row_id: {} and offset: "
@@ -612,8 +609,7 @@ JsonKeyStats::BuildKeyStatsForRow(const char* json_str, uint32_t row_id) {
             field_id_);
         bson_inverted_index_->AddRecord(key, row_id, offset);
     }
-    auto bson = final_doc.extract();
-    parquet_writer_->AppendSharedRow(bson.view().data(), bson.view().length());
+    parquet_writer_->AppendSharedRow(final_doc.data(), final_doc.length());
 
     parquet_writer_->AddCurrentRow();
 }
@@ -784,7 +780,10 @@ JsonKeyStats::BuildWithFieldData(const std::vector<FieldDataPtr>& field_datas,
         ParquetWriterFactory::CreateContext(key_types_, remote_prefix);
     parquet_writer_->Init(std::move(writer_context));
     BuildKeyStats(field_datas, nullable);
-    parquet_writer_->Close();
+    auto close_status = parquet_writer_->Close();
+    AssertInfo(close_status.ok(),
+               "failed to close json stats parquet writer: {}",
+               close_status.ToString());
     bson_inverted_index_->BuildIndex();
 
     // write meta file with layout type map and other metadata
@@ -1020,8 +1019,8 @@ JsonKeyStats::LoadColumnGroup(int64_t column_group_id,
                segment_id_);
 
     auto enable_mmap = !mmap_filepath_.empty();
-    auto column_group_info =
-        FieldDataInfo(column_group_id, field_id_, num_rows, mmap_filepath_);
+    auto column_group_info = FieldDataInfo(
+        column_group_id, field_id_, num_rows, mmap_filepath_, false, shard_);
     LOG_INFO(
         "loads column group {} with num_rows {} for segment "
         "{}",
@@ -1127,10 +1126,11 @@ JsonKeyStats::LoadSharedKeyIndex(
     load_info.index_size = index_size;
     load_info.load_priority = load_priority_;
     load_info.warmup_policy = warmup_policy;
+    load_info.shard = shard_;
     std::unique_ptr<cachinglayer::Translator<index::BsonInvertedIndex>>
         translator = std::make_unique<
             segcore::storagev1translator::BsonInvertedIndexTranslator>(
-            load_info, disk_file_manager_);
+            load_info, file_manager_context_);
 
     bson_index_cache_slot_ =
         cachinglayer::Manager::GetInstance().CreateCacheSlot(
@@ -1161,6 +1161,8 @@ JsonKeyStats::Load(milvus::tracer::TraceContext ctx, const Config& config) {
     LOG_INFO("load json stats for segment {} with load priority: {}",
              segment_id_,
              static_cast<int>(load_priority_));
+    shard_ = GetValueFromConfig<std::string>(config, JSON_STATS_CACHE_SHARD_KEY)
+                 .value_or("");
 
     auto index_files =
         GetValueFromConfig<std::vector<std::string>>(config, "index_files");

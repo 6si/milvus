@@ -32,7 +32,8 @@ import (
 	"github.com/milvus-io/milvus/internal/util/streamingutil"
 	"github.com/milvus-io/milvus/internal/util/streamingutil/util"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
@@ -170,11 +171,11 @@ func TestWALFlusher_DispatchObservesTruncateCollectionBeforeHandlingWithoutAckSy
 func newTestWALFlusher(rs recovery.RecoveryStorage) *WALFlusherImpl {
 	return &WALFlusherImpl{
 		notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
-		logger:          log.With(),
+		logger:          mlog.With(),
 		RecoveryStorage: rs,
 		flusherComponents: &flusherComponents{
 			dataServices: make(map[string]*dataSyncServiceWrapper),
-			logger:       log.With(),
+			logger:       mlog.With(),
 			rs:           rs,
 		},
 	}
@@ -321,12 +322,68 @@ func TestDispatch_CommitImportMessage(t *testing.T) {
 	// Build a minimal WALFlusherImpl for dispatch testing.
 	impl := &WALFlusherImpl{
 		notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
-		logger:          log.With(log.FieldComponent("test-flusher")),
+		logger:          mlog.With(mlog.FieldComponent("test-flusher")),
 		RecoveryStorage: rs,
 	}
 
 	err := impl.dispatch(immutableMsg)
 	assert.NoError(t, err)
+}
+
+func TestDispatch_CommitImportMessage_RetriesHandleCommitVchannelBeforeObserve(t *testing.T) {
+	streamingutil.SetStreamingServiceEnabled()
+	defer streamingutil.UnsetStreamingServiceEnabled()
+
+	const (
+		vchannel = "test-vchannel"
+		jobID    = int64(42)
+		timeTick = uint64(200)
+	)
+
+	mutableMsg := message.NewCommitImportMessageBuilderV2().
+		WithHeader(&message.CommitImportMessageHeader{
+			CollectionId: 100,
+			JobId:        jobID,
+		}).
+		WithBody(&message.CommitImportMessageBody{}).
+		WithVChannel(vchannel).
+		MustBuildMutable()
+	mutableMsg.WithTimeTick(timeTick)
+	mutableMsg.WithLastConfirmed(rmq.NewRmqID(199))
+	immutableMsg := mutableMsg.IntoImmutableMessage(rmq.NewRmqID(200))
+
+	mixcoord := mocks.NewMockMixCoordClient(t)
+	mixcoord.EXPECT().HandleCommitVchannel(mock.Anything, mock.MatchedBy(func(req *datapb.HandleCommitVchannelRequest) bool {
+		return req.GetJobId() == jobID && req.GetVchannel() == vchannel && req.GetCommitTimestamp() == timeTick
+	})).Return(merr.Status(merr.WrapErrImportSysFailedMsg("job not ready")), nil).Once()
+	mixcoord.EXPECT().HandleCommitVchannel(mock.Anything, mock.MatchedBy(func(req *datapb.HandleCommitVchannelRequest) bool {
+		return req.GetJobId() == jobID && req.GetVchannel() == vchannel && req.GetCommitTimestamp() == timeTick
+	})).Return(merr.Status(nil), nil).Once()
+	fMixcoord := syncutil.NewFuture[internaltypes.MixCoordClient]()
+	fMixcoord.Set(mixcoord)
+
+	mockWBMgr := writebuffer.NewMockBufferManager(t)
+	mockWBMgr.EXPECT().FlushChannel(mock.Anything, vchannel, timeTick).Return(nil).Once()
+
+	rs := mock_recovery.NewMockRecoveryStorage(t)
+	rs.EXPECT().ObserveMessage(mock.Anything, immutableMsg).Return(nil).Once()
+
+	resource.InitForTest(
+		t,
+		resource.OptMixCoordClient(fMixcoord),
+		resource.OptWriteBufferManager(mockWBMgr),
+	)
+
+	impl := &WALFlusherImpl{
+		notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
+		logger:          mlog.With(mlog.FieldComponent("test-flusher")),
+		RecoveryStorage: rs,
+	}
+
+	require.NotPanics(t, func() {
+		err := impl.dispatch(immutableMsg)
+		require.NoError(t, err)
+	})
 }
 
 func TestDispatch_CommitImportMessage_ChannelNotFoundStillCommitsVchannelNoPanic(t *testing.T) {
@@ -375,7 +432,7 @@ func TestDispatch_CommitImportMessage_ChannelNotFoundStillCommitsVchannelNoPanic
 
 	impl := &WALFlusherImpl{
 		notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
-		logger:          log.With(log.FieldComponent("test-flusher")),
+		logger:          mlog.With(mlog.FieldComponent("test-flusher")),
 		RecoveryStorage: rs,
 	}
 
@@ -383,6 +440,84 @@ func TestDispatch_CommitImportMessage_ChannelNotFoundStillCommitsVchannelNoPanic
 		err := impl.dispatch(immutableMsg)
 		require.NoError(t, err)
 	})
+}
+
+func TestWALFlusher_ExecuteReturnsObserveMessageError(t *testing.T) {
+	streamingutil.SetStreamingServiceEnabled()
+	defer streamingutil.UnsetStreamingServiceEnabled()
+
+	const (
+		vchannel = "test-vchannel"
+		jobID    = int64(42)
+		timeTick = uint64(200)
+	)
+
+	mutableMsg := message.NewCommitImportMessageBuilderV2().
+		WithHeader(&message.CommitImportMessageHeader{
+			CollectionId: 100,
+			JobId:        jobID,
+		}).
+		WithBody(&message.CommitImportMessageBody{}).
+		WithVChannel(vchannel).
+		MustBuildMutable()
+	mutableMsg.WithTimeTick(timeTick)
+	mutableMsg.WithLastConfirmed(rmq.NewRmqID(199))
+	immutableMsg := mutableMsg.IntoImmutableMessage(rmq.NewRmqID(200))
+
+	mixcoord := mocks.NewMockMixCoordClient(t)
+	mixcoord.EXPECT().HandleCommitVchannel(mock.Anything, mock.MatchedBy(func(req *datapb.HandleCommitVchannelRequest) bool {
+		return req.GetJobId() == jobID && req.GetVchannel() == vchannel && req.GetCommitTimestamp() == timeTick
+	})).Return(merr.Status(nil), nil).Once()
+	fMixcoord := syncutil.NewFuture[internaltypes.MixCoordClient]()
+	fMixcoord.Set(mixcoord)
+
+	mockWBMgr := writebuffer.NewMockBufferManager(t)
+	mockWBMgr.EXPECT().FlushChannel(mock.Anything, vchannel, timeTick).Return(nil).Once()
+
+	rs := mock_recovery.NewMockRecoveryStorage(t)
+	rs.EXPECT().ObserveMessage(mock.Anything, immutableMsg).Return(errors.New("observe failed")).Once()
+
+	l := mock_wal.NewMockWAL(t)
+	pchannel := types.PChannelInfo{Name: "pchannel"}
+	l.EXPECT().WALName().Return(message.WALNameRocksmq).Maybe()
+	l.EXPECT().Channel().Return(pchannel).Maybe()
+	l.EXPECT().Read(mock.Anything, mock.Anything).RunAndReturn(
+		func(ctx context.Context, option wal.ReadOption) (wal.Scanner, error) {
+			ch := make(chan message.ImmutableMessage, 1)
+			ch <- immutableMsg
+			scanner := mock_wal.NewMockScanner(t)
+			scanner.EXPECT().Chan().Return(ch)
+			scanner.EXPECT().Close().Return(nil)
+			return scanner, nil
+		}).Once()
+
+	resource.InitForTest(
+		t,
+		resource.OptMixCoordClient(fMixcoord),
+		resource.OptWriteBufferManager(mockWBMgr),
+		resource.OptChunkManager(mock_storage.NewMockChunkManager(t)),
+	)
+
+	rateLimitComponent := rate.NewWALRateLimitComponent(pchannel)
+	defer rateLimitComponent.Close()
+	flusher := &WALFlusherImpl{
+		notifier:             syncutil.NewAsyncTaskNotifier[struct{}](),
+		wal:                  syncutil.NewFuture[wal.WAL](),
+		logger:               mlog.With(mlog.FieldComponent("test-flusher")),
+		metrics:              newFlusherMetrics(pchannel),
+		RecoveryStorage:      rs,
+		rateLimitComponent:   rateLimitComponent,
+		emptyTimeTickCounter: metrics.WALFlusherEmptyTimeTickFilteredTotal.WithLabelValues(paramtable.GetStringNodeID(), pchannel.Name),
+	}
+	flusher.wal.Set(l)
+
+	err := flusher.Execute(&recovery.RecoverySnapshot{
+		VChannels: map[string]*streamingpb.VChannelMeta{},
+		Checkpoint: &recovery.WALCheckpoint{
+			TimeTick: 0,
+		},
+	})
+	require.ErrorContains(t, err, "observe failed")
 }
 
 func TestDispatch_CommitImportMessage_FlushUnexpectedErrorPanics(t *testing.T) {
@@ -414,13 +549,12 @@ func TestDispatch_CommitImportMessage_FlushUnexpectedErrorPanics(t *testing.T) {
 		Once()
 
 	rs := mock_recovery.NewMockRecoveryStorage(t)
-	rs.EXPECT().ObserveMessage(mock.Anything, mock.Anything).Return(nil)
 
 	resource.InitForTest(t, resource.OptWriteBufferManager(mockWBMgr))
 
 	impl := &WALFlusherImpl{
 		notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
-		logger:          log.With(log.FieldComponent("test-flusher")),
+		logger:          mlog.With(mlog.FieldComponent("test-flusher")),
 		RecoveryStorage: rs,
 	}
 
@@ -466,7 +600,7 @@ func TestDispatch_RollbackImportMessage_NoOp(t *testing.T) {
 
 			impl := &WALFlusherImpl{
 				notifier:        syncutil.NewAsyncTaskNotifier[struct{}](),
-				logger:          log.With(log.FieldComponent("test-flusher")),
+				logger:          mlog.With(mlog.FieldComponent("test-flusher")),
 				RecoveryStorage: rs,
 			}
 

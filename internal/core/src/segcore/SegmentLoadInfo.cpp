@@ -67,6 +67,7 @@ SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
     load_index_info.field_id = field_id.get();
     load_index_info.collection_id = GetCollectionID();
     load_index_info.partition_id = GetPartitionID();
+    load_index_info.shard = GetInsertChannel();
 
     // Get field type from schema
     const auto& field_meta = schema_->operator[](field_id);
@@ -143,17 +144,21 @@ SegmentLoadInfo::ConvertFieldIndexInfoToLoadIndexInfo(
 
 bool
 SegmentLoadInfo::CheckIndexHasRawData(const LoadIndexInfo& load_index_info) {
-    auto request = milvus::index::IndexFactory::GetInstance().IndexLoadResource(
-        load_index_info.field_type,
-        load_index_info.element_type,
-        load_index_info.index_engine_version,
-        load_index_info.index_size,
-        load_index_info.index_params,
-        load_index_info.enable_mmap,
-        load_index_info.num_rows,
-        load_index_info.dim);
-
-    return request.has_raw_data;
+    if (load_index_info.load_resource_request.has_value()) {
+        return load_index_info.load_resource_request->has_raw_data;
+    } else {
+        auto request =
+            milvus::index::IndexFactory::GetInstance().IndexLoadResource(
+                load_index_info.field_type,
+                load_index_info.element_type,
+                load_index_info.index_engine_version,
+                load_index_info.index_size,
+                load_index_info.index_params,
+                load_index_info.enable_mmap,
+                load_index_info.num_rows,
+                load_index_info.dim);
+        return request.has_raw_data;
+    }
 }
 
 std::shared_ptr<proto::indexcgo::LoadTextIndexInfo>

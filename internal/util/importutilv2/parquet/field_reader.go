@@ -219,7 +219,7 @@ func (c *FieldReader) Next(count int64) (any, any, error) {
 			return nil, nil, nil
 		}
 		vectors := lo.Flatten(arrayData.([][]float32))
-		return vectors, nil, nil
+		return vectors, nil, typeutil.VerifyFloats32(vectors)
 	case schemapb.DataType_SparseFloatVector:
 		if c.field.GetNullable() {
 			return ReadNullableSparseFloatVectorData(c, count)
@@ -1131,9 +1131,9 @@ func parseSparseFloatVectorStructRow(st map[string]arrow.Array, row int) ([]byte
 	}
 
 	maxDim := uint32(0)
-	// set the maxDim as the last value of sortedIndices since it has been sorted
+	// Sparse vector dim is the largest index plus one.
 	if len(sortedIndices) > 0 {
-		maxDim = sortedIndices[len(sortedIndices)-1]
+		maxDim = sortedIndices[len(sortedIndices)-1] + 1
 	}
 	return rowVec, maxDim, nil // rowVec could be an empty sparse
 }

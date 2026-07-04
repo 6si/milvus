@@ -70,6 +70,7 @@ set(MILVUS_TEST_FILES
         TextLobSpilloverTest.cpp
         test_commit_timestamp.cpp
         test_schema_reopen.cpp
+        test_growing_concurrent_reopen.cpp
         )
 
 if ( NOT (INDEX_ENGINE STREQUAL "cardinal") )
@@ -123,6 +124,16 @@ endif()
 add_compile_definitions(
         MILVUS_CPPUT_OUTPUT_DIR="${CMAKE_INSTALL_PREFIX}/cpput_output"
         MILVUS_UNIT_TEST)
+
+if (LINUX)
+    # milvus-storage's Rust bridge (librust_bridge.a) statically embeds xxhash
+    # and re-exports its XXH* symbols globally. These collide with the conan
+    # xxhash that milvus_core links for BloomFilter/MinHash, so linking the
+    # unit-test binaries fails with "multiple definition of `XXH...'". Tell the
+    # GNU linker to keep the first definition instead of erroring on the
+    # duplicate. Applies to every test target declared below (and subdirs).
+    add_link_options("LINKER:--allow-multiple-definition")
+endif()
 
 add_executable(all_tests
         ${MILVUS_TEST_FILES}

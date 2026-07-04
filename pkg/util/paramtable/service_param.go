@@ -17,6 +17,7 @@
 package paramtable
 
 import (
+	"context"
 	"encoding/json"
 	"net/url"
 	"os"
@@ -25,10 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"go.uber.org/zap"
-
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/etcd"
 	"github.com/milvus-io/milvus/pkg/v3/util/metricsinfo"
@@ -106,6 +105,7 @@ type EtcdConfig struct {
 	EtcdTLSCACert        ParamItem          `refreshable:"false"`
 	EtcdTLSMinVersion    ParamItem          `refreshable:"false"`
 	RequestTimeout       ParamItem          `refreshable:"false"`
+	DialTimeout          ParamItem          `refreshable:"false"`
 	DialKeepAliveTime    ParamItem          `refreshable:"false"`
 	DialKeepAliveTimeout ParamItem          `refreshable:"false"`
 
@@ -290,6 +290,15 @@ We recommend using version 1.2 and above.`,
 	}
 	p.RequestTimeout.Init(base.mgr)
 
+	p.DialTimeout = ParamItem{
+		Key:          "etcd.dialTimeout",
+		DefaultValue: "5000",
+		Version:      "2.6.12",
+		Doc:          `Timeout in milliseconds for establishing the initial connection to etcd endpoints. Increase it for environments where transient network delays are expected during node scale-out.`,
+		Export:       true,
+	}
+	p.DialTimeout.Init(base.mgr)
+
 	p.DialKeepAliveTime = ParamItem{
 		Key:          "etcd.dialKeepAliveTime",
 		DefaultValue: "3000",
@@ -318,7 +327,7 @@ We recommend using version 1.2 and above.`,
 	p.EtcdEnableAuth.Init(base.mgr)
 
 	if p.UseEmbedEtcd.GetAsBool() && p.EtcdEnableAuth.GetAsBool() {
-		log.Warn("embedded etcd does not support auth, disabling etcd auth automatically")
+		mlog.Warn(context.TODO(), "embedded etcd does not support auth, disabling etcd auth automatically")
 		p.EtcdEnableAuth.SwapTempValue("false")
 	}
 
@@ -359,6 +368,7 @@ func (p *EtcdConfig) GetAll() map[string]string {
 		"etcd.ssl.tlsCACert":        p.EtcdTLSCACert.GetValue(),
 		"etcd.ssl.tlsMinVersion":    p.EtcdTLSMinVersion.GetValue(),
 		"etcd.requestTimeout":       p.RequestTimeout.GetValue(),
+		"etcd.dialTimeout":          p.DialTimeout.GetValue(),
 		"etcd.dialKeepAliveTime":    p.DialKeepAliveTime.GetValue(),
 		"etcd.dialKeepAliveTimeout": p.DialKeepAliveTimeout.GetValue(),
 		"etcd.auth.enabled":         p.EtcdEnableAuth.GetValue(),
@@ -368,15 +378,18 @@ func (p *EtcdConfig) GetAll() map[string]string {
 }
 
 func (p *EtcdConfig) ClientOptions() []etcd.ClientOption {
+	dialTimeout := p.DialTimeout.GetAsDuration(time.Millisecond)
 	dialKeepAliveTime := p.DialKeepAliveTime.GetAsDuration(time.Millisecond)
 	dialKeepAliveTimeout := p.DialKeepAliveTimeout.GetAsDuration(time.Millisecond)
 
-	if dialKeepAliveTime <= 0 && dialKeepAliveTimeout <= 0 {
-		return nil
+	var options []etcd.ClientOption
+	if dialTimeout > 0 {
+		options = append(options, etcd.WithDialTimeout(dialTimeout))
 	}
-	return []etcd.ClientOption{
-		etcd.WithDialKeepAlive(dialKeepAliveTime, dialKeepAliveTimeout),
+	if dialKeepAliveTime > 0 || dialKeepAliveTimeout > 0 {
+		options = append(options, etcd.WithDialKeepAlive(dialKeepAliveTime, dialKeepAliveTimeout))
 	}
+	return options
 }
 
 // /////////////////////////////////////////////////////////////////////////////
@@ -833,7 +846,7 @@ Example configuration below:
     seeds: [n1,n2,n3] # List of seed node addresses for this pool
   - name: region2 # Name of the region pool
     seeds: [n4,n5,n6] # List of seed node addresses for this pool`,
-		Export: false,
+		Export: true,
 	}
 	p.QuorumBufferPools.Init(base.mgr)
 
@@ -843,7 +856,7 @@ Example configuration below:
 		Version:      "2.6.0",
 		DefaultValue: "soft",
 		Doc:          "Affinity mode for node selection rules. Valid values: [soft, hard]",
-		Export:       false,
+		Export:       true,
 	}
 	p.QuorumAffinityMode.Init(base.mgr)
 
@@ -852,7 +865,7 @@ Example configuration below:
 		Version:      "2.6.0",
 		DefaultValue: "3",
 		Doc:          "Number of replicas in the quorum ensemble. Valid values: [3, 5]",
-		Export:       false,
+		Export:       true,
 	}
 	p.QuorumReplicas.Init(base.mgr)
 
@@ -869,7 +882,7 @@ multi-az-single-rg: Multiple availability zones, single resource group
 multi-az-multi-rg: Multiple availability zones and resource groups
 cross-region: Nodes across different regions for maximum durability
 custom: Use custom expressions defined below`,
-		Export: false,
+		Export: true,
 	}
 	p.QuorumStrategy.Init(base.mgr)
 
@@ -892,7 +905,7 @@ Example configuration below:
     region: "default-region-pool"
     az: "az.*"
     resourceGroup: "rg.*"`,
-		Export: false,
+		Export: true,
 	}
 	p.QuorumCustomPlacement.Init(base.mgr)
 
@@ -1037,7 +1050,7 @@ Valid values: [auto, enable, disable]`,
 		Key:          "woodpecker.storage.type",
 		Version:      "2.6.0",
 		DefaultValue: "minio",
-		Doc:          "The Type of the storage provider. Valid values: [minio, local]",
+		Doc:          "The Type of the storage provider. Valid values: [minio, local, service]",
 		Export:       true,
 	}
 	p.StorageType.Init(base.mgr)
@@ -1137,7 +1150,7 @@ Default value applies when Pulsar is running on the same network with Milvus.`,
 		Formatter: func(add string) string {
 			pulsarURL, err := url.ParseRequestURI(p.Address.GetValue())
 			if err != nil {
-				log.Info("failed to parse pulsar config, assume pulsar not used", zap.Error(err))
+				mlog.Info(context.TODO(), "failed to parse pulsar config, assume pulsar not used", mlog.Err(err))
 				return ""
 			}
 			return "http://" + pulsarURL.Hostname() + ":" + p.WebPort.GetValue()

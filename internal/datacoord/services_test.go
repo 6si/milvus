@@ -16,7 +16,6 @@ import (
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/milvuspb"
@@ -45,7 +44,7 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingcoord/server/broadcaster/registry"
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/pkg/v3/kv"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
@@ -91,7 +90,7 @@ func (s *ServerSuite) SetupTest() {
 
 func (s *ServerSuite) TearDownTest() {
 	if s.testServer != nil {
-		log.Info("ServerSuite tears down test", zap.String("name", s.T().Name()))
+		mlog.Info(context.TODO(), "ServerSuite tears down test", mlog.String("name", s.T().Name()))
 		closeTestServer(s.T(), s.testServer)
 	}
 }
@@ -1990,7 +1989,7 @@ func TestServer_FlushAll(t *testing.T) {
 			}
 			msg.WithBroadcastID(1)
 			retry.Do(context.Background(), func() error {
-				log.Info("broadcast message", log.FieldMessage(msg))
+				mlog.Info(context.TODO(), "broadcast message", mlog.FieldMessage(msg))
 				return registry.CallMessageAckCallback(context.Background(), msg, results)
 			}, retry.AttemptAlways())
 			return &types2.BroadcastAppendResult{
@@ -3142,6 +3141,26 @@ func TestServer_RestoreSnapshot(t *testing.T) {
 		assert.Error(t, merr.Error(resp.GetStatus()))
 	})
 
+	t.Run("external_restore_not_implemented", func(t *testing.T) {
+		ctx := context.Background()
+
+		server := &Server{}
+		server.stateCode.Store(commonpb.StateCode_Healthy)
+
+		resp, err := server.RestoreSnapshot(ctx, &datapb.RestoreSnapshotRequest{
+			External:             true,
+			SnapshotS3Location:   "s3://bucket/export-root/snapshots/100/metadata/1.json",
+			TargetDbName:         "default",
+			TargetCollectionName: "new_collection",
+		})
+
+		assert.NoError(t, err)
+		statusErr := merr.Error(resp.GetStatus())
+		assert.Error(t, statusErr)
+		assert.True(t, errors.Is(statusErr, merr.ErrServiceUnimplemented))
+		assert.False(t, merr.IsRetryableErr(statusErr))
+	})
+
 	t.Run("missing_snapshot_name", func(t *testing.T) {
 		ctx := context.Background()
 
@@ -3211,6 +3230,25 @@ func TestServer_RestoreSnapshot(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Error(t, merr.Error(resp.GetStatus()))
 	})
+}
+
+func TestServer_ExportSnapshot(t *testing.T) {
+	ctx := context.Background()
+
+	server := &Server{}
+	server.stateCode.Store(commonpb.StateCode_Healthy)
+
+	resp, err := server.ExportSnapshot(ctx, &datapb.ExportSnapshotRequest{
+		Name:         "test_snapshot",
+		CollectionId: 100,
+		TargetS3Path: "s3://bucket/export-root",
+	})
+
+	assert.NoError(t, err)
+	statusErr := merr.Error(resp.GetStatus())
+	assert.Error(t, statusErr)
+	assert.True(t, errors.Is(statusErr, merr.ErrServiceUnimplemented))
+	assert.False(t, merr.IsRetryableErr(statusErr))
 }
 
 // --- Test CreateSnapshot additional cases ---
@@ -5479,6 +5517,32 @@ func TestAbortImport_HappyPath(t *testing.T) {
 	assert.True(t, merr.Ok(resp))
 }
 
+func TestAbortImport_UserAbortedJobIsIdempotent(t *testing.T) {
+	ctx := context.Background()
+
+	job := &importJob{
+		ImportJob: &datapb.ImportJob{
+			JobID:      2002,
+			State:      internalpb.ImportJobState_Failed,
+			Reason:     "aborted by user",
+			AutoCommit: false,
+		},
+	}
+
+	importMetaMock := NewMockImportMeta(t)
+	importMetaMock.EXPECT().GetJob(mock.Anything, int64(2002)).Return(job).Once()
+
+	server := &Server{
+		importMeta:    importMetaMock,
+		importJobLock: lock.NewKeyLock[int64](),
+	}
+	server.stateCode.Store(commonpb.StateCode_Healthy)
+
+	resp, err := server.AbortImport(ctx, &datapb.AbortImportRequest{JobId: 2002})
+	assert.NoError(t, err)
+	assert.True(t, merr.Ok(resp))
+}
+
 func TestHandleCommitVchannelRPC(t *testing.T) {
 	ctx := context.Background()
 
@@ -5567,6 +5631,29 @@ func TestHandleCommitVchannelRPC_StoresCommitTimestamp(t *testing.T) {
 		assert.EqualValues(t, 500, seg.GetCommitTimestamp())
 		assert.False(t, seg.GetIsImporting())
 	}
+}
+
+func TestHandleCommitVchannelRPC_MissingJobReturnsError(t *testing.T) {
+	ctx := context.Background()
+
+	catalog := mocks.NewDataCoordCatalog(t)
+	catalog.EXPECT().ListImportJobs(mock.Anything).Return(nil, nil)
+	catalog.EXPECT().ListPreImportTasks(mock.Anything).Return(nil, nil)
+	catalog.EXPECT().ListImportTasks(mock.Anything).Return(nil, nil)
+
+	importMeta, err := NewImportMeta(ctx, catalog, nil, nil)
+	require.NoError(t, err)
+
+	server := &Server{
+		importMeta: importMeta,
+	}
+	server.stateCode.Store(commonpb.StateCode_Healthy)
+
+	resp, err := server.HandleCommitVchannel(ctx, &datapb.HandleCommitVchannelRequest{
+		JobId:    3001,
+		Vchannel: "vchan-0",
+	})
+	require.ErrorIs(t, merr.CheckRPCCall(resp, err), merr.ErrImportSysFailed)
 }
 
 // Named helper types for mockey interface-method patching. Using named types

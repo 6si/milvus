@@ -28,7 +28,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 
@@ -42,8 +41,8 @@ import (
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
 	"github.com/milvus-io/milvus/internal/util/function/validator"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/planpb"
@@ -188,6 +187,111 @@ func TestValidateResourceGroupName(t *testing.T) {
 	for _, name := range invalidNames {
 		assert.NotNil(t, ValidateResourceGroupName(name))
 	}
+}
+
+func TestNamespacePartitionRoutingHelpers(t *testing.T) {
+	namespace := "tenant_partition"
+	partitionModeSchema := &schemapb.CollectionSchema{
+		EnableNamespace: true,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition},
+		},
+	}
+	partitionKeyModeSchema := &schemapb.CollectionSchema{
+		EnableNamespace: true,
+		Fields: []*schemapb.FieldSchema{
+			{FieldID: 101, Name: common.NamespaceFieldName, DataType: schemapb.DataType_VarChar, IsPartitionKey: true},
+		},
+	}
+
+	t.Run("single partition name", func(t *testing.T) {
+		partitionName, usedNamespacePartition, err := resolveNamespacePartitionName(partitionModeSchema, &namespace, "")
+		require.NoError(t, err)
+		assert.True(t, usedNamespacePartition)
+		assert.Equal(t, namespace, partitionName)
+
+		partitionName, usedNamespacePartition, err = resolveNamespacePartitionName(partitionModeSchema, &namespace, namespace)
+		require.NoError(t, err)
+		assert.True(t, usedNamespacePartition)
+		assert.Equal(t, namespace, partitionName)
+
+		_, _, err = resolveNamespacePartitionName(partitionModeSchema, &namespace, "other_partition")
+		require.ErrorIs(t, err, merr.ErrParameterInvalid)
+
+		emptyNamespace := ""
+		_, _, err = resolveNamespacePartitionName(partitionModeSchema, &emptyNamespace, "")
+		require.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("partition name list", func(t *testing.T) {
+		partitionNames, usedNamespacePartition, err := resolveNamespacePartitionNames(partitionModeSchema, &namespace, nil)
+		require.NoError(t, err)
+		assert.True(t, usedNamespacePartition)
+		assert.Equal(t, []string{namespace}, partitionNames)
+
+		partitionNames, usedNamespacePartition, err = resolveNamespacePartitionNames(partitionModeSchema, &namespace, []string{namespace})
+		require.NoError(t, err)
+		assert.True(t, usedNamespacePartition)
+		assert.Equal(t, []string{namespace}, partitionNames)
+
+		_, _, err = resolveNamespacePartitionNames(partitionModeSchema, &namespace, []string{"other_partition"})
+		require.ErrorIs(t, err, merr.ErrParameterInvalid)
+
+		_, _, err = resolveNamespacePartitionNames(partitionModeSchema, &namespace, []string{namespace, "other_partition"})
+		require.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("default mode keeps namespace as plan filter", func(t *testing.T) {
+		partitionName, usedNamespacePartition, err := resolveNamespacePartitionName(partitionKeyModeSchema, &namespace, "")
+		require.NoError(t, err)
+		assert.False(t, usedNamespacePartition)
+		assert.Empty(t, partitionName)
+
+		partitionNames, usedNamespacePartition, err := resolveNamespacePartitionNames(partitionKeyModeSchema, &namespace, nil)
+		require.NoError(t, err)
+		assert.False(t, usedNamespacePartition)
+		assert.Empty(t, partitionNames)
+
+		assert.Same(t, &namespace, namespaceForPlan(partitionKeyModeSchema, &namespace))
+		assert.Nil(t, namespaceForPlan(partitionModeSchema, &namespace))
+	})
+}
+
+func TestAddNamespaceDataPartitionMode(t *testing.T) {
+	namespace := "tenant_partition"
+	schema := &schemapb.CollectionSchema{
+		EnableNamespace: true,
+		Properties: []*commonpb.KeyValuePair{
+			{Key: common.NamespaceModeKey, Value: common.NamespaceModePartition},
+		},
+	}
+	insertMsg := &msgstream.InsertMsg{
+		InsertRequest: &msgpb.InsertRequest{
+			Namespace: &namespace,
+			NumRows:   3,
+		},
+	}
+
+	err := addNamespaceData(schema, insertMsg)
+	require.NoError(t, err)
+	assert.Equal(t, namespace, insertMsg.GetPartitionName())
+	assert.Empty(t, insertMsg.GetFieldsData())
+}
+
+func TestConvertHybridSearchToSearchCopiesNamespace(t *testing.T) {
+	namespace := "tenant_partition"
+	req := &milvuspb.HybridSearchRequest{
+		DbName:         "default",
+		CollectionName: "coll",
+		Namespace:      &namespace,
+		Requests: []*milvuspb.SearchRequest{
+			{Dsl: "pk > 0"},
+		},
+	}
+
+	searchReq := convertHybridSearchToSearch(req)
+	require.NotNil(t, searchReq.Namespace)
+	assert.Equal(t, namespace, searchReq.GetNamespace())
 }
 
 func TestValidateDatabaseName(t *testing.T) {
@@ -1194,7 +1298,7 @@ func Test_isPartitionIsLoaded(t *testing.T) {
 
 func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 	paramtable.Init()
-	log.Info("InsertTaskcheckFieldsDataBySchema", zap.Bool("enable", Params.ProxyCfg.SkipAutoIDCheck.GetAsBool()))
+	mlog.Info(context.TODO(), "InsertTaskcheckFieldsDataBySchema", mlog.Bool("enable", Params.ProxyCfg.SkipAutoIDCheck.GetAsBool()))
 	var err error
 
 	t.Run("schema is empty, though won't happen in system", func(t *testing.T) {
@@ -1218,7 +1322,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.Equal(t, nil, err)
 		assert.Equal(t, len(task.insertMsg.FieldsData), 0)
 	})
@@ -1248,7 +1352,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1289,7 +1393,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.Equal(t, nil, err)
 		assert.Equal(t, len(task.insertMsg.FieldsData), 2)
 	})
@@ -1319,7 +1423,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.Equal(t, nil, err)
 		assert.Equal(t, len(task.insertMsg.FieldsData), 0)
 	})
@@ -1348,7 +1452,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1382,7 +1486,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1420,7 +1524,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1454,7 +1558,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1488,7 +1592,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 
@@ -1521,7 +1625,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, false)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, false)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 	})
 	t.Run("normal when upsert", func(t *testing.T) {
@@ -1564,7 +1668,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, false)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, false)
 		assert.NoError(t, err)
 
 		task = insertTask{
@@ -1605,7 +1709,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 				},
 			},
 		}
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, false)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, false)
 		assert.NoError(t, err)
 	})
 
@@ -1648,7 +1752,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.ErrorIs(t, merr.ErrParameterInvalid, err)
 		assert.Equal(t, len(task.insertMsg.FieldsData), 2)
 
@@ -1691,7 +1795,7 @@ func Test_InsertTaskcheckFieldsDataBySchema(t *testing.T) {
 			},
 		}
 
-		err = checkFieldsDataBySchema(task.schema.Fields, task.schema, task.insertMsg, true)
+		err = checkFieldsDataBySchema(context.TODO(), task.schema.Fields, task.schema, task.insertMsg, true)
 		assert.NoError(t, err)
 		assert.Equal(t, len(task.insertMsg.FieldsData), 2)
 		paramtable.Get().Reset(Params.ProxyCfg.SkipAutoIDCheck.Key)
@@ -1723,7 +1827,7 @@ func Test_InsertTaskCheckPrimaryFieldData(t *testing.T) {
 		},
 	}
 
-	_, err := checkPrimaryFieldData(case1.schema.Fields, case1.schema, case1.insertMsg)
+	_, err := checkPrimaryFieldData(context.TODO(), case1.schema.Fields, case1.schema, case1.insertMsg)
 	assert.NotEqual(t, nil, err)
 
 	// the num of passed fields is less than needed
@@ -1764,7 +1868,7 @@ func Test_InsertTaskCheckPrimaryFieldData(t *testing.T) {
 			Status: merr.Success(),
 		},
 	}
-	_, err = checkPrimaryFieldData(case2.schema.Fields, case2.schema, case2.insertMsg)
+	_, err = checkPrimaryFieldData(context.TODO(), case2.schema.Fields, case2.schema, case2.insertMsg)
 	assert.NotEqual(t, nil, err)
 
 	// autoID == false, no primary field schema
@@ -1804,7 +1908,7 @@ func Test_InsertTaskCheckPrimaryFieldData(t *testing.T) {
 			Status: merr.Success(),
 		},
 	}
-	_, err = checkPrimaryFieldData(case3.schema.Fields, case3.schema, case3.insertMsg)
+	_, err = checkPrimaryFieldData(context.TODO(), case3.schema.Fields, case3.schema, case3.insertMsg)
 	assert.NotEqual(t, nil, err)
 
 	// autoID == true, has primary field schema, but primary field data exist
@@ -1851,7 +1955,7 @@ func Test_InsertTaskCheckPrimaryFieldData(t *testing.T) {
 	case4.schema.Fields[0].IsPrimaryKey = true
 	case4.schema.Fields[0].AutoID = true
 	case4.insertMsg.FieldsData[0] = newScalarFieldData(case4.schema.Fields[0], case4.schema.Fields[0].Name, 10)
-	_, err = checkPrimaryFieldData(case4.schema.Fields, case4.schema, case4.insertMsg)
+	_, err = checkPrimaryFieldData(context.TODO(), case4.schema.Fields, case4.schema, case4.insertMsg)
 	assert.NotEqual(t, nil, err)
 
 	// autoID == true, has primary field schema, but DataType don't match
@@ -1859,7 +1963,7 @@ func Test_InsertTaskCheckPrimaryFieldData(t *testing.T) {
 	case4.schema.Fields[0].IsPrimaryKey = false
 	case4.schema.Fields[1].IsPrimaryKey = true
 	case4.schema.Fields[1].AutoID = true
-	_, err = checkPrimaryFieldData(case4.schema.Fields, case4.schema, case4.insertMsg)
+	_, err = checkPrimaryFieldData(context.TODO(), case4.schema.Fields, case4.schema, case4.insertMsg)
 	assert.NotEqual(t, nil, err)
 }
 
@@ -1887,7 +1991,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NotEqual(t, nil, err)
 	})
 
@@ -1931,7 +2035,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NotEqual(t, nil, err)
 	})
 
@@ -1972,7 +2076,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NotEqual(t, nil, err)
 	})
 
@@ -2017,7 +2121,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NotEqual(t, nil, err)
 	})
 
@@ -2068,7 +2172,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NotEqual(t, nil, err)
 	})
 
@@ -2109,7 +2213,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NoError(t, nil, err)
 
 		// autoid==false
@@ -2148,7 +2252,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err = checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err = checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		assert.NoError(t, nil, err)
 	})
 
@@ -2199,7 +2303,7 @@ func Test_UpsertTaskCheckPrimaryFieldData(t *testing.T) {
 				Status: merr.Success(),
 			},
 		}
-		_, _, err := checkUpsertPrimaryFieldData(task.schema.Fields, task.schema, task.insertMsg)
+		_, _, err := checkUpsertPrimaryFieldData(context.TODO(), task.schema.Fields, task.schema, task.insertMsg)
 		newPK := task.insertMsg.FieldsData[0].GetScalars().GetLongData().GetData()
 		assert.Equal(t, newPK, task.insertMsg.RowIDs)
 		assert.NoError(t, nil, err)
@@ -2300,7 +2404,7 @@ func Test_GetPartitionProgressFailed(t *testing.T) {
 func TestErrWithLog(t *testing.T) {
 	err := errors.New("test")
 	assert.ErrorIs(t, ErrWithLog(nil, "foo", err), err)
-	assert.ErrorIs(t, ErrWithLog(log.Ctx(context.Background()), "foo", err), err)
+	assert.ErrorIs(t, ErrWithLog(mlog.With(), "foo", err), err)
 }
 
 func Test_CheckDynamicFieldData(t *testing.T) {
@@ -4614,6 +4718,71 @@ func Test_reconstructStructFieldData(t *testing.T) {
 		// Should not modify anything for count(*) query
 		assert.Equal(t, originalFieldsData, resultFieldsData)
 		assert.Equal(t, originalOutputFields, resultOutputFields)
+	})
+
+	t.Run("group by with count(*) should preserve aggregate field", func(t *testing.T) {
+		fieldsData := []*schemapb.FieldData{
+			{
+				FieldName: "id",
+				FieldId:   100,
+				Type:      schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_LongData{
+							LongData: &schemapb.LongArray{Data: []int64{1, 2}},
+						},
+					},
+				},
+			},
+			{
+				FieldName: "count(*)",
+				FieldId:   0,
+				Type:      schemapb.DataType_Int64,
+				Field: &schemapb.FieldData_Scalars{
+					Scalars: &schemapb.ScalarField{
+						Data: &schemapb.ScalarField_LongData{
+							LongData: &schemapb.LongArray{Data: []int64{3, 4}},
+						},
+					},
+				},
+			},
+		}
+		outputFields := []string{"id", "count(*)"}
+
+		schema := &schemapb.CollectionSchema{
+			Fields: []*schemapb.FieldSchema{
+				{
+					FieldID:      100,
+					Name:         "id",
+					IsPrimaryKey: true,
+					DataType:     schemapb.DataType_Int64,
+				},
+			},
+			StructArrayFields: []*schemapb.StructArrayFieldSchema{
+				{
+					FieldID: 102,
+					Name:    "test_struct",
+					Fields: []*schemapb.FieldSchema{
+						{
+							FieldID:     1021,
+							Name:        "test_struct[sub_field]",
+							DataType:    schemapb.DataType_Array,
+							ElementType: schemapb.DataType_Int32,
+						},
+					},
+				},
+			},
+		}
+
+		resultFieldsData, resultOutputFields := reconstructStructFieldData(fieldsData, outputFields, schema)
+
+		assert.Len(t, resultFieldsData, 2)
+		assert.Equal(t, "id", resultFieldsData[0].FieldName)
+		assert.Equal(t, int64(100), resultFieldsData[0].FieldId)
+		assert.Equal(t, "count(*)", resultFieldsData[1].FieldName)
+		assert.Equal(t, int64(0), resultFieldsData[1].FieldId)
+		assert.Equal(t, []string{"id", "count(*)"}, resultOutputFields)
+		assert.Equal(t, []int64{3, 4}, resultFieldsData[1].GetScalars().GetLongData().GetData())
 	})
 
 	t.Run("struct field query - should reconstruct struct field", func(t *testing.T) {

@@ -73,6 +73,8 @@ const (
 	RoleConfigPrivilege  = "privilege"
 
 	PreserveFieldIdsKey = "preserve_field_ids"
+
+	PrivilegeExpr = "PrivilegeExpr"
 )
 
 var (
@@ -122,6 +124,8 @@ var (
 		commonpb.ObjectType_Global.String(): {
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegePinSnapshotData.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeUnpinSnapshotData.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeRestoreExternalSnapshot.String()),
+			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeExportSnapshot.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeAll.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeCreateCollection.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeDropCollection.String()),
@@ -171,6 +175,8 @@ var (
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeGroupCollectionReadWrite.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeGroupCollectionAdmin.String()),
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeUpdateReplicateConfiguration.String()),
+
+			MetaStore2API(PrivilegeExpr),
 		},
 		commonpb.ObjectType_User.String(): {
 			MetaStore2API(commonpb.ObjectPrivilege_PrivilegeUpdateUser.String()),
@@ -236,7 +242,6 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeFlush.String(),
 		commonpb.ObjectPrivilege_PrivilegeCompaction.String(),
 		commonpb.ObjectPrivilege_PrivilegeLoadBalance.String(),
-		commonpb.ObjectPrivilege_PrivilegeRenameCollection.String(),
 		commonpb.ObjectPrivilege_PrivilegeCreateAlias.String(),
 		commonpb.ObjectPrivilege_PrivilegeDropAlias.String(),
 		commonpb.ObjectPrivilege_PrivilegeCreateSnapshot.String(),
@@ -306,6 +311,8 @@ var (
 		commonpb.ObjectPrivilege_PrivilegeDescribeSnapshot.String(),
 		commonpb.ObjectPrivilege_PrivilegeListSnapshots.String(),
 		commonpb.ObjectPrivilege_PrivilegeRestoreSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeExportSnapshot.String(),
+		commonpb.ObjectPrivilege_PrivilegeRestoreExternalSnapshot.String(),
 		commonpb.ObjectPrivilege_PrivilegePinSnapshotData.String(),
 		commonpb.ObjectPrivilege_PrivilegeUnpinSnapshotData.String(),
 		commonpb.ObjectPrivilege_PrivilegeRefreshExternalCollection.String(),
@@ -379,6 +386,11 @@ var (
 		ConvertPrivileges([]string{
 			commonpb.ObjectPrivilege_PrivilegeCreateCollection.String(),
 			commonpb.ObjectPrivilege_PrivilegeDropCollection.String(),
+			// RenameCollection is a database-admin privilege: a same-db rename is
+			// authorized at database level; a cross-db rename additionally requires
+			// a cluster-scoped (db="*") grant (see PrivilegeInterceptor). It is
+			// intentionally NOT part of the collection-level ReadWrite group.
+			commonpb.ObjectPrivilege_PrivilegeRenameCollection.String(),
 		})...,
 	)
 
@@ -418,11 +430,13 @@ var (
 			commonpb.ObjectPrivilege_PrivilegeCreateResourceGroup.String(),
 			commonpb.ObjectPrivilege_PrivilegeDropResourceGroup.String(),
 			commonpb.ObjectPrivilege_PrivilegeUpdateUser.String(),
-			commonpb.ObjectPrivilege_PrivilegeRenameCollection.String(),
 			commonpb.ObjectPrivilege_PrivilegeCreatePrivilegeGroup.String(),
 			commonpb.ObjectPrivilege_PrivilegeDropPrivilegeGroup.String(),
 			commonpb.ObjectPrivilege_PrivilegeOperatePrivilegeGroup.String(),
 			commonpb.ObjectPrivilege_PrivilegeUpdateReplicateConfiguration.String(),
+			PrivilegeExpr,
+			commonpb.ObjectPrivilege_PrivilegeRestoreExternalSnapshot.String(),
+			commonpb.ObjectPrivilege_PrivilegeExportSnapshot.String(),
 		})...,
 	)
 )
@@ -477,8 +491,7 @@ func MetaStore2API(name string) string {
 }
 
 func PrivilegeNameForAPI(name string) string {
-	_, ok := commonpb.ObjectPrivilege_value[name]
-	if !ok {
+	if !isPrivilegeNameForMetastoreDefined(name) {
 		if strings.HasPrefix(name, PrivilegeGroupWord) {
 			return typeutil.After(name, PrivilegeGroupWord)
 		}
@@ -490,17 +503,24 @@ func PrivilegeNameForAPI(name string) string {
 func PrivilegeNameForMetastore(name string) string {
 	// check if name is single privilege
 	dbPrivilege := PrivilegeWord + name
-	_, ok := commonpb.ObjectPrivilege_value[dbPrivilege]
-	if !ok {
+	if !isPrivilegeNameForMetastoreDefined(dbPrivilege) {
 		// check if name is privilege group
 		dbPrivilege := PrivilegeGroupWord + name
-		_, ok := commonpb.ObjectPrivilege_value[dbPrivilege]
-		if !ok {
+		if !isPrivilegeNameForMetastoreDefined(dbPrivilege) {
 			return ""
 		}
 		return dbPrivilege
 	}
 	return dbPrivilege
+}
+
+func isPrivilegeNameForMetastoreDefined(name string) bool {
+	if _, ok := commonpb.ObjectPrivilege_value[name]; ok {
+		return true
+	}
+	// TODO: drop this special case once PrivilegeExpr is promoted to a proto enum value
+	// in milvus-io/milvus-proto (commonpb.ObjectPrivilege_PrivilegeExpr).
+	return name == PrivilegeExpr
 }
 
 // check if the name is defined by built in privileges or privilege groups in system

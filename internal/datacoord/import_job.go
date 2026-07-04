@@ -17,14 +17,14 @@
 package datacoord
 
 import (
+	"context"
 	"time"
 
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/timerecord"
@@ -63,6 +63,8 @@ func WithoutJobStates(states ...internalpb.ImportJobState) ImportJobFilter {
 
 type UpdateJobAction func(job ImportJob)
 
+const importJobReasonAbortedByUser = "aborted by user"
+
 func UpdateJobState(state internalpb.ImportJobState) UpdateJobAction {
 	return func(job ImportJob) {
 		job.(*importJob).State = state
@@ -74,8 +76,8 @@ func UpdateJobState(state internalpb.ImportJobState) UpdateJobAction {
 			cleanupTime := time.Now().Add(dur)
 			cleanupTs := tsoutil.ComposeTSByTime(cleanupTime, 0)
 			job.(*importJob).CleanupTs = cleanupTs
-			log.Info("set import job cleanup ts", zap.Int64("jobID", job.GetJobID()),
-				zap.Time("cleanupTime", cleanupTime), zap.Uint64("cleanupTs", cleanupTs))
+			mlog.Info(context.TODO(), "set import job cleanup ts", mlog.FieldJobID(job.GetJobID()),
+				mlog.Time("cleanupTime", cleanupTime), mlog.Uint64("cleanupTs", cleanupTs))
 		}
 	}
 }

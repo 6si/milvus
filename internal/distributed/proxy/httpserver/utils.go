@@ -33,7 +33,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	oteltrace "go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 	"google.golang.org/protobuf/proto"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/commonpb"
@@ -44,9 +43,10 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy"
 	"github.com/milvus-io/milvus/internal/proxy/accesslog"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/function/chain"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/util"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
@@ -92,7 +92,6 @@ func TraceIDHandlerFunc(c *gin.Context) {
 	traceID := span.SpanContext().TraceID()
 	if traceID.IsValid() {
 		traceIDStr := traceID.String()
-		ctx = log.WithTraceID(ctx, traceIDStr)
 		c.Set("traceID", traceIDStr)
 		c.Request = c.Request.WithContext(ctx)
 		setTraceIDHeader(c)
@@ -802,7 +801,7 @@ func checkAndSetData(body []byte, collSchema *schemapb.CollectionSchema, partial
 						case gjson.Null:
 							// skip null
 						default:
-							log.Warn("unknown json type found", zap.Int("mapValue.Type", int(mapValue.Type)))
+							mlog.Warn(context.TODO(), "unknown json type found", mlog.Int("mapValue.Type", int(mapValue.Type)))
 						}
 					} else {
 						return nil, nil, merr.WrapErrParameterInvalidMsg("has pass more field without dynamic schema, please check it")
@@ -1944,24 +1943,24 @@ func anyToColumns(rows []map[string]interface{}, validDataMap map[string][]bool,
 		if fieldLen[name] == 0 && partialUpdate {
 			if hasValidData {
 				if len(validData) != rowsLen {
-					log.Info("field len is not equal to rows len",
-						zap.String("fieldName", name),
-						zap.Int("fieldLen", len(validData)),
-						zap.Int("rowsLen", rowsLen))
+					mlog.Info(context.TODO(), "field len is not equal to rows len",
+						mlog.String("fieldName", name),
+						mlog.Int("fieldLen", len(validData)),
+						mlog.Int("rowsLen", rowsLen))
 					return nil, merr.WrapErrParameterInvalidMsg("column %s has length %d, expected %d", name, len(validData), rowsLen)
 				}
 			} else {
-				log.Info("skip empty field for partial update",
-					zap.String("fieldName", name))
+				mlog.Info(context.TODO(), "skip empty field for partial update",
+					mlog.String("fieldName", name))
 				continue
 			}
 		}
 		if fieldLen[name] != rowsLen && partialUpdate && (!hasValidData || len(validData) != rowsLen) {
 			// for partial update, if try to update different field in different rows, return error
-			log.Info("field len is not equal to rows len",
-				zap.String("fieldName", name),
-				zap.Int("fieldLen", fieldLen[name]),
-				zap.Int("rowsLen", rowsLen))
+			mlog.Info(context.TODO(), "field len is not equal to rows len",
+				mlog.String("fieldName", name),
+				mlog.Int("fieldLen", fieldLen[name]),
+				mlog.Int("rowsLen", rowsLen))
 			return nil, merr.WrapErrParameterInvalidMsg("column %s has length %d, expected %d", name, fieldLen[name], rowsLen)
 		}
 
@@ -2669,7 +2668,8 @@ func buildQueryResp(rowsNum int64, needFields []string, fieldDataList []*schemap
 
 						err := json.Unmarshal(fieldDataList[j].GetScalars().GetJsonData().Data[dataIdx], &dataMap)
 						if err != nil {
-							log.Error(fmt.Sprintf("[BuildQueryResp] Unmarshal error %s", err.Error()))
+							mlog.Error(context.TODO(),
+								fmt.Sprintf("[BuildQueryResp] Unmarshal error %s", err.Error()))
 							return nil, err
 						}
 
@@ -2959,7 +2959,7 @@ func CheckLimiter(ctx context.Context, req interface{}, pxy types.ProxyComponent
 	// apply limiter for http/http2 server
 	limiter, err := pxy.GetRateLimiter()
 	if err != nil {
-		log.Error("Get proxy rate limiter for httpV1/V2 server failed", zap.Error(err))
+		mlog.Error(ctx, "Get proxy rate limiter for httpV1/V2 server failed", mlog.Err(err))
 		return nil, err
 	}
 
@@ -3619,7 +3619,7 @@ func convertTopHitsReq(req *TopHitsReq) (*commonpb.TopHitsSpec, error) {
 func genFunctionSchema(ctx context.Context, function *FunctionSchema) (*schemapb.FunctionSchema, error) {
 	functionTypeValue, ok := schemapb.FunctionType_value[function.FunctionType]
 	if !ok {
-		log.Ctx(ctx).Warn("function's data type is invalid(case sensitive).", zap.Any("function.DataType", function.FunctionType), zap.Any("function", function))
+		mlog.Warn(ctx, "function's data type is invalid(case sensitive).", mlog.Any("function.DataType", function.FunctionType), mlog.Any("function", function))
 		return nil, merr.WrapErrParameterInvalidMsg("Unsupported function type: %s", function.FunctionType)
 	}
 	functionType := schemapb.FunctionType(functionTypeValue)
@@ -3662,4 +3662,199 @@ func genFunctionScore(ctx context.Context, functionScore *FunctionScore) (*schem
 		fScore.Params = append(fScore.Params, &commonpb.KeyValuePair{Key: key, Value: fmt.Sprintf("%v", value)})
 	}
 	return &fScore, nil
+}
+
+func genFunctionChains(chains []FunctionChainReq) ([]*schemapb.FunctionChain, error) {
+	result := make([]*schemapb.FunctionChain, 0, len(chains))
+	for i, chainReq := range chains {
+		chainPB, err := genFunctionChain(chainReq)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("functionChains[%d]: %v", i, err)
+		}
+		result = append(result, chainPB)
+	}
+	return result, nil
+}
+
+func genFunctionChain(req FunctionChainReq) (*schemapb.FunctionChain, error) {
+	stage, err := genFunctionChainStage(req.Stage)
+	if err != nil {
+		return nil, err
+	}
+
+	ops := make([]*schemapb.FunctionChainOp, 0, len(req.Ops))
+	for i, opReq := range req.Ops {
+		opPB, err := genFunctionChainOp(opReq)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("ops[%d]: %v", i, err)
+		}
+		ops = append(ops, opPB)
+	}
+
+	return &schemapb.FunctionChain{
+		Name:  strings.TrimSpace(req.Name),
+		Stage: stage,
+		Ops:   ops,
+	}, nil
+}
+
+func genFunctionChainStage(stageName string) (schemapb.FunctionChainStage, error) {
+	stageName = strings.TrimSpace(stageName)
+	stageValue, ok := schemapb.FunctionChainStage_value[stageName]
+	if !ok {
+		return schemapb.FunctionChainStage_FunctionChainStageUnspecified, merr.WrapErrParameterInvalidMsg("unsupported function chain stage: %s", stageName)
+	}
+	stage := schemapb.FunctionChainStage(stageValue)
+	if _, err := chain.ProtoStageToReprStage(stage); err != nil {
+		return schemapb.FunctionChainStage_FunctionChainStageUnspecified, err
+	}
+	return stage, nil
+}
+
+func genFunctionChainOp(req FunctionChainOpReq) (*schemapb.FunctionChainOp, error) {
+	opName := strings.TrimSpace(req.Op)
+	if opName == "" {
+		return nil, merr.WrapErrParameterInvalidMsg("op name is empty")
+	}
+
+	paramMap, err := genFunctionParamMap(req.Params)
+	if err != nil {
+		return nil, merr.WrapErrParameterInvalidMsg("params: %v", err)
+	}
+
+	var exprPB *schemapb.FunctionChainExpr
+	if req.Expr != nil {
+		exprPB, err = genFunctionChainExpr(*req.Expr)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("expr: %v", err)
+		}
+	}
+
+	return &schemapb.FunctionChainOp{
+		Op:      opName,
+		Expr:    exprPB,
+		Inputs:  trimStringList(req.Inputs),
+		Outputs: trimStringList(req.Outputs),
+		Params:  paramMap,
+	}, nil
+}
+
+func genFunctionChainExpr(req FunctionChainExprReq) (*schemapb.FunctionChainExpr, error) {
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		return nil, merr.WrapErrParameterInvalidMsg("expr name is empty")
+	}
+
+	args := make([]*schemapb.FunctionChainExprArg, 0, len(req.Args))
+	for i, argReq := range req.Args {
+		argPB, err := genFunctionChainExprArg(argReq)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("args[%d]: %v", i, err)
+		}
+		args = append(args, argPB)
+	}
+
+	params, err := genFunctionParamMap(req.Params)
+	if err != nil {
+		return nil, merr.WrapErrParameterInvalidMsg("params: %v", err)
+	}
+
+	return &schemapb.FunctionChainExpr{
+		Name:   name,
+		Args:   args,
+		Params: params,
+	}, nil
+}
+
+func genFunctionChainExprArg(req FunctionChainExprArgReq) (*schemapb.FunctionChainExprArg, error) {
+	hasColumn := req.Column != nil
+	hasLiteral := req.Literal != nil
+	if hasColumn == hasLiteral {
+		return nil, merr.WrapErrParameterInvalidMsg("exactly one of column or literal is required")
+	}
+	if hasColumn {
+		name := strings.TrimSpace(*req.Column)
+		if name == "" {
+			return nil, merr.WrapErrParameterInvalidMsg("column name is empty")
+		}
+		return &schemapb.FunctionChainExprArg{
+			Arg: &schemapb.FunctionChainExprArg_Column{
+				Column: &schemapb.FunctionChainColumnArg{Name: name},
+			},
+		}, nil
+	}
+
+	literal, err := genFunctionParamValue(req.Literal)
+	if err != nil {
+		return nil, merr.WrapErrParameterInvalidMsg("literal: %v", err)
+	}
+	return &schemapb.FunctionChainExprArg{
+		Arg: &schemapb.FunctionChainExprArg_Literal{Literal: literal},
+	}, nil
+}
+
+func genFunctionParamMap(params map[string]interface{}) (map[string]*schemapb.FunctionParamValue, error) {
+	result := make(map[string]*schemapb.FunctionParamValue, len(params))
+	for key, value := range params {
+		paramName := strings.TrimSpace(key)
+		if paramName == "" {
+			return nil, merr.WrapErrParameterInvalidMsg("param name is empty")
+		}
+		paramValue, err := genFunctionParamValue(value)
+		if err != nil {
+			return nil, merr.WrapErrParameterInvalidMsg("param %q: %v", key, err)
+		}
+		result[paramName] = paramValue
+	}
+	return result, nil
+}
+
+func genFunctionParamValue(value interface{}) (*schemapb.FunctionParamValue, error) {
+	switch v := value.(type) {
+	case nil:
+		return nil, merr.WrapErrParameterInvalidMsg("function param value is nil")
+	case bool:
+		return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_BoolValue{BoolValue: v}}, nil
+	case float64:
+		if math.Trunc(v) == v && v >= math.MinInt64 && v <= math.MaxInt64 {
+			return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_Int64Value{Int64Value: int64(v)}}, nil
+		}
+		return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_DoubleValue{DoubleValue: v}}, nil
+	case string:
+		return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_StringValue{StringValue: v}}, nil
+	case []interface{}:
+		values := make([]*schemapb.FunctionParamValue, 0, len(v))
+		for i, item := range v {
+			converted, err := genFunctionParamValue(item)
+			if err != nil {
+				return nil, merr.WrapErrParameterInvalidMsg("array[%d]: %v", i, err)
+			}
+			values = append(values, converted)
+		}
+		return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_ArrayValue{ArrayValue: &schemapb.FunctionParamArray{Values: values}}}, nil
+	case map[string]interface{}:
+		fields := make(map[string]*schemapb.FunctionParamValue, len(v))
+		for key, item := range v {
+			fieldName := strings.TrimSpace(key)
+			if fieldName == "" {
+				return nil, merr.WrapErrParameterInvalidMsg("object field name is empty")
+			}
+			converted, err := genFunctionParamValue(item)
+			if err != nil {
+				return nil, merr.WrapErrParameterInvalidMsg("object field %q: %v", key, err)
+			}
+			fields[fieldName] = converted
+		}
+		return &schemapb.FunctionParamValue{Value: &schemapb.FunctionParamValue_ObjectValue{ObjectValue: &schemapb.FunctionParamObject{Fields: fields}}}, nil
+	default:
+		return nil, merr.WrapErrParameterInvalidMsg("unsupported function param value type %T", value)
+	}
+}
+
+func trimStringList(values []string) []string {
+	trimmed := make([]string, len(values))
+	for i, value := range values {
+		trimmed[i] = strings.TrimSpace(value)
+	}
+	return trimmed
 }

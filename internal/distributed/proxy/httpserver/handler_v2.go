@@ -32,7 +32,6 @@ import (
 	"github.com/samber/lo"
 	"github.com/tidwall/gjson"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/proto"
 
@@ -46,12 +45,13 @@ import (
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/metrics"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/datapb"
 	"github.com/milvus-io/milvus/pkg/v3/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v3/util/commonpbutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/crypto"
+	"github.com/milvus-io/milvus/pkg/v3/util/externalspec"
 	"github.com/milvus-io/milvus/pkg/v3/util/funcutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
@@ -165,6 +165,10 @@ var routeToMethod = map[string]string{ //nolint:gosec // not credentials, just a
 	"/v2/vectordb/jobs/import/describe":              "GetImportProgress",
 	"/v2/vectordb/jobs/import/commit":                "CommitImport",
 	"/v2/vectordb/jobs/import/abort":                 "AbortImport",
+	"/v2/vectordb/jobs/snapshot/restore_external":    "RestoreExternalSnapshot",
+	"/v2/vectordb/jobs/snapshot/export":              "ExportSnapshot",
+	"/v2/vectordb/jobs/snapshot/describe":            "GetRestoreSnapshotState",
+	"/v2/vectordb/jobs/snapshot/list":                "ListRestoreSnapshotJobs",
 	"/v2/vectordb/jobs/external_collection/refresh":  "RefreshExternalCollection",
 	"/v2/vectordb/jobs/external_collection/describe": "GetRefreshExternalCollectionProgress",
 	"/v2/vectordb/jobs/external_collection/list":     "ListRefreshExternalCollectionJobs",
@@ -320,6 +324,10 @@ func (h *HandlersV2) RegisterRoutesToV2(router gin.IRouter) {
 	router.POST(ImportJobCategory+DescribeAction, timeoutMiddleware(wrapperPost(func() any { return &JobIDReq{} }, wrapperTraceLog(h.getImportJobProcess))))
 	router.POST(ImportJobCategory+CommitAction, timeoutMiddleware(wrapperPost(func() any { return &JobIDReq{} }, wrapperTraceLog(h.commitImportJob))))
 	router.POST(ImportJobCategory+AbortAction, timeoutMiddleware(wrapperPost(func() any { return &JobIDReq{} }, wrapperTraceLog(h.abortImportJob))))
+	router.POST(SnapshotJobCategory+RestoreExternalAction, timeoutMiddleware(wrapperPost(func() any { return &RestoreExternalSnapshotReq{} }, wrapperTraceLog(h.restoreExternalSnapshot))))
+	router.POST(SnapshotJobCategory+ExportAction, timeoutMiddleware(wrapperPost(func() any { return &ExportSnapshotReq{} }, wrapperTraceLog(h.exportSnapshot))))
+	router.POST(SnapshotJobCategory+DescribeAction, timeoutMiddleware(wrapperPost(func() any { return &JobIDReq{} }, wrapperTraceLog(h.getRestoreSnapshotState))))
+	router.POST(SnapshotJobCategory+ListAction, timeoutMiddleware(wrapperPost(func() any { return &OptionalCollectionNameReq{} }, wrapperTraceLog(h.listRestoreSnapshotJobs))))
 	router.POST(ExternalCollectionJobCategory+RefreshAction, timeoutMiddleware(wrapperPost(func() any { return &RefreshExternalCollectionReq{} }, wrapperTraceLog(h.refreshExternalCollection))))
 	router.POST(ExternalCollectionJobCategory+DescribeAction, timeoutMiddleware(wrapperPost(func() any { return &RefreshExternalCollectionProgressReq{} }, wrapperTraceLog(h.getRefreshExternalCollectionProgress))))
 	router.POST(ExternalCollectionJobCategory+ListAction, timeoutMiddleware(wrapperPost(func() any { return &OptionalCollectionNameReq{} }, wrapperTraceLog(h.listRefreshExternalCollectionJobs))))
@@ -349,8 +357,8 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 	return func(gCtx *gin.Context) {
 		req := newReq()
 		if err := gCtx.ShouldBindBodyWith(req, binding.JSON); err != nil {
-			log.Warn("high level restful api, read parameters from request body fail", zap.Error(err),
-				zap.Any("url", gCtx.Request.URL.Path))
+			mlog.Warn(context.TODO(), "high level restful api, read parameters from request body fail", mlog.Err(err),
+				mlog.Any("url", gCtx.Request.URL.Path))
 			if _, ok := err.(validator.ValidationErrors); ok {
 				HTTPAbortReturn(gCtx, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(merr.ErrMissingRequiredParameters),
@@ -388,8 +396,8 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 		ctx := gCtx.Request.Context()
 		username, _ := gCtx.Get(ContextUsername)
 		ctx = proxy.NewContextWithMetadata(ctx, username.(string), dbName)
-		log.Ctx(ctx).Debug("high level restful api, read parameters from request body, then start to handle.",
-			zap.Any("url", gCtx.Request.URL.Path))
+		mlog.Debug(ctx, "high level restful api, read parameters from request body, then start to handle.",
+			mlog.Any("url", gCtx.Request.URL.Path))
 
 		resp, err := v2(ctx, gCtx, req, dbName)
 		methodTag, ok := routeToMethod[gCtx.FullPath()]
@@ -429,16 +437,16 @@ func wrapperPost(newReq newReqFunc, v2 handlerFuncV2) gin.HandlerFunc {
 			if label == metrics.FailInputLabel {
 				errType = merr.InputError
 			}
-			logger := log.Ctx(ctx).With(
-				zap.String("method", methodTag),
-				zap.String("error_type", errType.String()),
-				zap.Int32("code", status.GetCode()),
-				zap.String("reason", status.GetReason()),
+			logger := mlog.With(
+				mlog.String("method", methodTag),
+				mlog.String("error_type", errType.String()),
+				mlog.Int32("code", status.GetCode()),
+				mlog.String("reason", status.GetReason()),
 			)
 			if errType == merr.InputError {
-				logger.Info("restful request returned an input error")
+				logger.Info(ctx, "restful request returned an input error")
 			} else {
-				logger.Warn("restful request returned a system error")
+				logger.Warn(ctx, "restful request returned a system error")
 			}
 		}
 	}
@@ -454,6 +462,27 @@ func restfulSizeMiddleware(handler gin.HandlerFunc, observeOutbound bool) gin.Ha
 	}
 }
 
+func getTraceLogRequestFieldWithoutSensitiveInfo(req any) mlog.Field {
+	switch request := req.(type) {
+	case *RestoreExternalSnapshotReq:
+		if request == nil {
+			return proxy.GetRequestFieldWithoutSensitiveInfo(req)
+		}
+		redactedReq := *request
+		redactedReq.ExternalSpec = externalspec.RedactExternalSpec(request.ExternalSpec)
+		return mlog.Any("request", &redactedReq)
+	case *ExportSnapshotReq:
+		if request == nil {
+			return proxy.GetRequestFieldWithoutSensitiveInfo(req)
+		}
+		redactedReq := *request
+		redactedReq.ExternalSpec = externalspec.RedactExternalSpec(request.ExternalSpec)
+		return mlog.Any("request", &redactedReq)
+	default:
+		return proxy.GetRequestFieldWithoutSensitiveInfo(req)
+	}
+}
+
 func wrapperTraceLog(v2 handlerFuncV2) handlerFuncV2 {
 	return func(ctx context.Context, c *gin.Context, req any, dbName string) (interface{}, error) {
 		switch proxy.Params.CommonCfg.TraceLogMode.GetAsInt() {
@@ -461,26 +490,26 @@ func wrapperTraceLog(v2 handlerFuncV2) handlerFuncV2 {
 			fields := proxy.GetRequestBaseInfo(ctx, req, &grpc.UnaryServerInfo{
 				FullMethod: c.Request.URL.Path,
 			}, false)
-			log.Ctx(ctx).Info("trace info: simple", fields...)
+			mlog.Info(ctx, "trace info: simple", fields...)
 		case 2: // detail info
 			fields := proxy.GetRequestBaseInfo(ctx, req, &grpc.UnaryServerInfo{
 				FullMethod: c.Request.URL.Path,
 			}, true)
-			fields = append(fields, proxy.GetRequestFieldWithoutSensitiveInfo(req))
-			log.Ctx(ctx).Info("trace info: detail", fields...)
+			fields = append(fields, getTraceLogRequestFieldWithoutSensitiveInfo(req))
+			mlog.Info(ctx, "trace info: detail", fields...)
 		case 3: // detail info with request and response
 			fields := proxy.GetRequestBaseInfo(ctx, req, &grpc.UnaryServerInfo{
 				FullMethod: c.Request.URL.Path,
 			}, true)
-			fields = append(fields, proxy.GetRequestFieldWithoutSensitiveInfo(req))
-			log.Ctx(ctx).Info("trace info: all request", fields...)
+			fields = append(fields, getTraceLogRequestFieldWithoutSensitiveInfo(req))
+			mlog.Info(ctx, "trace info: all request", fields...)
 		}
 		resp, err := v2(ctx, c, req, dbName)
 		if proxy.Params.CommonCfg.TraceLogMode.GetAsInt() > 2 {
 			if err != nil {
-				log.Ctx(ctx).Info("trace info: all, error", zap.Error(err))
+				mlog.Info(ctx, "trace info: all, error", mlog.Err(err))
 			} else {
-				log.Ctx(ctx).Info("trace info: all, unknown")
+				mlog.Info(ctx, "trace info: all, unknown")
 			}
 		}
 		return resp, err
@@ -538,7 +567,7 @@ func wrapperProxyWithLimit(ctx context.Context, ginCtx *gin.Context, req any, ch
 	if checkLimit {
 		_, err := CheckLimiter(ctx, req, pxy)
 		if err != nil {
-			log.Warn("high level restful api, fail to check limiter", zap.Error(err), zap.String("method", fullMethod))
+			mlog.Warn(context.TODO(), "high level restful api, fail to check limiter", mlog.Err(err), mlog.String("method", fullMethod))
 			hookutil.GetExtension().ReportAction(ctx, req, WrapErrorToResponse(merr.ErrHTTPRateLimit), nil, ginCtx.FullPath(), hookutil.ActionAuthorize)
 			HTTPAbortReturn(ginCtx, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrHTTPRateLimit),
@@ -547,7 +576,7 @@ func wrapperProxyWithLimit(ctx context.Context, ginCtx *gin.Context, req any, ch
 			return nil, RestRequestInterceptorErr
 		}
 	}
-	log.Ctx(ctx).Debug("high level restful api, try to do a grpc call")
+	mlog.Debug(ctx, "high level restful api, try to do a grpc call")
 	username, ok := ginCtx.Get(ContextUsername)
 	if !ok {
 		username = ""
@@ -577,7 +606,7 @@ func wrapperProxyWithLimit(ctx context.Context, ginCtx *gin.Context, req any, ch
 		// Expose the exact classification (incl. boundary InputError marks) to
 		// the REST access log; key must match accesslog/info.ContextErrorType.
 		ginCtx.Set("error_type", merr.GetErrorType(err).String())
-		log.Ctx(ctx).Warn("high level restful api, grpc call failed", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, grpc call failed", mlog.Err(err))
 		if !ignoreErr {
 			HTTPAbortReturn(ginCtx, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
 		}
@@ -641,7 +670,7 @@ func (h *HandlersV2) getCollectionDetails(ctx context.Context, c *gin.Context, a
 	primaryField, ok := getPrimaryField(coll.Schema)
 	autoID := false
 	if !ok {
-		log.Ctx(ctx).Warn("high level restful api, get primary field from collection schema fail", zap.Any("collection schema", coll.Schema), zap.Any("request", anyReq))
+		mlog.Warn(ctx, "high level restful api, get primary field from collection schema fail", mlog.Any("collection schema", coll.Schema), mlog.Any("request", anyReq))
 	} else {
 		autoID = primaryField.AutoID
 	}
@@ -1195,7 +1224,7 @@ func (h *HandlersV2) query(ctx context.Context, c *gin.Context, anyReq any, dbNa
 	}
 	req.ConsistencyLevel, req.UseDefaultConsistency, err = convertConsistencyLevel(httpReq.ConsistencyLevel)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, query with consistency_level invalid", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, query with consistency_level invalid", mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded, err:" + err.Error(),
@@ -1218,7 +1247,7 @@ func (h *HandlersV2) query(ctx context.Context, c *gin.Context, anyReq any, dbNa
 		allowJS, _ := strconv.ParseBool(c.Request.Header.Get(HTTPHeaderAllowInt64))
 		outputData, err := buildQueryResp(int64(0), queryResp.OutputFields, queryResp.FieldsData, nil, nil, allowJS, collSchema)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, fail to deal with query result", zap.Any("response", resp), zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, fail to deal with query result", mlog.Any("response", resp), mlog.Err(err))
 			HTTPReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrInvalidSearchResult),
 				HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
@@ -1270,7 +1299,7 @@ func (h *HandlersV2) get(ctx context.Context, c *gin.Context, anyReq any, dbName
 	}
 	req.ConsistencyLevel, req.UseDefaultConsistency, err = convertConsistencyLevel(httpReq.ConsistencyLevel)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, query with consistency_level invalid", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, query with consistency_level invalid", mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded, err:" + err.Error(),
@@ -1286,7 +1315,7 @@ func (h *HandlersV2) get(ctx context.Context, c *gin.Context, anyReq any, dbName
 		allowJS, _ := strconv.ParseBool(c.Request.Header.Get(HTTPHeaderAllowInt64))
 		outputData, err := buildQueryResp(int64(0), queryResp.OutputFields, queryResp.FieldsData, nil, nil, allowJS, collSchema)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, fail to deal with get result", zap.Any("response", resp), zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, fail to deal with get result", mlog.Any("response", resp), mlog.Err(err))
 			HTTPReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrInvalidSearchResult),
 				HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
@@ -1371,7 +1400,7 @@ func (h *HandlersV2) insert(ctx context.Context, c *gin.Context, anyReq any, dbN
 	var validDataMap map[string][]bool
 	httpReq.Data, validDataMap, err = checkAndSetData(body.([]byte), collSchema, false)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, fail to deal with insert data", zap.Error(err), zap.String("body", string(body.([]byte))))
+		mlog.Warn(ctx, "high level restful api, fail to deal with insert data", mlog.Err(err), mlog.String("body", string(body.([]byte))))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(merr.ErrInvalidInsertData),
 			HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
@@ -1382,7 +1411,7 @@ func (h *HandlersV2) insert(ctx context.Context, c *gin.Context, anyReq any, dbN
 	req.NumRows = uint32(len(httpReq.Data))
 	req.FieldsData, err = anyToColumns(httpReq.Data, validDataMap, collSchema, true, false)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, fail to deal with insert data", zap.Any("data", httpReq.Data), zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, fail to deal with insert data", mlog.Any("data", httpReq.Data), mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(merr.ErrInvalidInsertData),
 			HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
@@ -1455,7 +1484,7 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 	var validDataMap map[string][]bool
 	httpReq.Data, validDataMap, err = checkAndSetData(body.([]byte), collSchema, httpReq.PartialUpdate)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, fail to deal with upsert data", zap.Any("body", body), zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, fail to deal with upsert data", mlog.Any("body", body), mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(merr.ErrInvalidInsertData),
 			HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
@@ -1466,7 +1495,7 @@ func (h *HandlersV2) upsert(ctx context.Context, c *gin.Context, anyReq any, dbN
 	req.NumRows = uint32(len(httpReq.Data))
 	req.FieldsData, err = anyToColumns(httpReq.Data, validDataMap, collSchema, false, httpReq.PartialUpdate)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, fail to deal with upsert data", zap.Any("data", httpReq.Data), zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, fail to deal with upsert data", mlog.Any("data", httpReq.Data), mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(merr.ErrInvalidInsertData),
 			HTTPReturnMessage: merr.ErrInvalidInsertData.Error() + ", error: " + err.Error(),
@@ -1634,7 +1663,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 	var err error
 	req.ConsistencyLevel, req.UseDefaultConsistency, err = convertConsistencyLevel(httpReq.ConsistencyLevel)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, search with consistency_level invalid", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, search with consistency_level invalid", mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded, err:" + err.Error(),
@@ -1699,7 +1728,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 		}
 		req.SearchAggregation, err = convertSearchAggregationReq(httpReq.SearchAggregation)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, convert SearchAggregation failed", zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, convert SearchAggregation failed", mlog.Err(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
 			return nil, err
 		}
@@ -1707,7 +1736,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 
 	searchParams, err := generateSearchParams(httpReq.SearchParams)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, generate SearchParams failed", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, generate SearchParams failed", mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: err.Error(),
@@ -1729,6 +1758,12 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 			return nil, err
 		}
 	}
+	if len(httpReq.FunctionChains) != 0 {
+		if req.FunctionChains, err = genFunctionChains(httpReq.FunctionChains); err != nil {
+			HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(merr.ErrParameterInvalid), HTTPReturnMessage: err.Error()})
+			return nil, err
+		}
+	}
 
 	if hasIDs {
 		// Search by primary keys
@@ -1744,7 +1779,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 		// Convert ids to schemapb.IDs
 		ids, err := convertIDsToSchemapbIDs(httpReq.Ids, primaryField)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, convert ids to schemapb.IDs failed", zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, convert ids to schemapb.IDs failed", mlog.Err(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
 				HTTPReturnMessage: merr.ErrParameterInvalid.Error() + ", error: " + err.Error(),
@@ -1766,7 +1801,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 		body, _ := c.Get(gin.BodyBytesKey)
 		placeholderGroup, err := generatePlaceholderGroup(ctx, string(body.([]byte)), collSchema, httpReq.AnnsField)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, search with vector invalid", zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, search with vector invalid", mlog.Err(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrIncorrectParameterFormat),
 				HTTPReturnMessage: merr.ErrIncorrectParameterFormat.Error() + ", error: " + err.Error(),
@@ -1791,7 +1826,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 			allowJS, _ := strconv.ParseBool(c.Request.Header.Get(HTTPHeaderAllowInt64))
 			outputData, err := buildSearchAggregationResp(searchResp.Results, allowJS, collSchema)
 			if err != nil {
-				log.Ctx(ctx).Warn("high level restful api, fail to deal with search aggregation result", zap.Any("result", searchResp.Results), zap.Error(err))
+				mlog.Warn(ctx, "high level restful api, fail to deal with search aggregation result", mlog.Any("result", searchResp.Results), mlog.Err(err))
 				HTTPReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(merr.ErrInvalidSearchResult),
 					HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
@@ -1819,7 +1854,7 @@ func (h *HandlersV2) search(ctx context.Context, c *gin.Context, anyReq any, dbN
 			allowJS, _ := strconv.ParseBool(c.Request.Header.Get(HTTPHeaderAllowInt64))
 			outputData, err := buildQueryResp(0, searchResp.Results.OutputFields, searchResp.Results.FieldsData, searchResp.Results.Ids, searchResp.Results.Scores, allowJS, collSchema)
 			if err != nil {
-				log.Ctx(ctx).Warn("high level restful api, fail to deal with search result", zap.Any("result", searchResp.Results), zap.Error(err))
+				mlog.Warn(ctx, "high level restful api, fail to deal with search result", mlog.Any("result", searchResp.Results), mlog.Err(err))
 				HTTPReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(merr.ErrInvalidSearchResult),
 					HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
@@ -1884,7 +1919,7 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 	var err error
 	req.ConsistencyLevel, req.UseDefaultConsistency, err = convertConsistencyLevel(httpReq.ConsistencyLevel)
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, search with consistency_level invalid", zap.Error(err))
+		mlog.Warn(ctx, "high level restful api, search with consistency_level invalid", mlog.Err(err))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: "consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded, err:" + err.Error(),
@@ -1895,6 +1930,11 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 
 	if httpReq.SearchAggregation != nil {
 		err := merr.WrapErrParameterInvalidMsg("searchAggregation is not supported for hybrid search")
+		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
+		return nil, err
+	}
+	if len(httpReq.FunctionChains) != 0 {
+		err := merr.WrapErrParameterInvalidMsg("functionChains is not supported for hybrid search yet")
 		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(err), HTTPReturnMessage: err.Error()})
 		return nil, err
 	}
@@ -1916,7 +1956,7 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 	for i, subReq := range httpReq.Search {
 		searchParams, err := generateSearchParams(subReq.SearchParams)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, generate SearchParams failed", zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, generate SearchParams failed", mlog.Err(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -1928,7 +1968,7 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 		searchParams = append(searchParams, &commonpb.KeyValuePair{Key: proxy.AnnsFieldKey, Value: subReq.AnnsField})
 		placeholderGroup, err := generatePlaceholderGroup(ctx, searchArray[i].Raw, collSchema, subReq.AnnsField)
 		if err != nil {
-			log.Ctx(ctx).Warn("high level restful api, search with vector invalid", zap.Error(err))
+			mlog.Warn(ctx, "high level restful api, search with vector invalid", mlog.Err(err))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(merr.ErrIncorrectParameterFormat),
 				HTTPReturnMessage: merr.ErrIncorrectParameterFormat.Error() + ", error: " + err.Error(),
@@ -1986,7 +2026,7 @@ func (h *HandlersV2) advancedSearch(ctx context.Context, c *gin.Context, anyReq 
 			allowJS, _ := strconv.ParseBool(c.Request.Header.Get(HTTPHeaderAllowInt64))
 			outputData, err := buildQueryResp(0, searchResp.Results.OutputFields, searchResp.Results.FieldsData, searchResp.Results.Ids, searchResp.Results.Scores, allowJS, collSchema)
 			if err != nil {
-				log.Ctx(ctx).Warn("high level restful api, fail to deal with search result", zap.Any("result", searchResp.Results), zap.Error(err))
+				mlog.Warn(ctx, "high level restful api, fail to deal with search result", mlog.Any("result", searchResp.Results), mlog.Err(err))
 				HTTPReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(merr.ErrInvalidSearchResult),
 					HTTPReturnMessage: merr.ErrInvalidSearchResult.Error() + ", error: " + err.Error(),
@@ -2015,7 +2055,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 	if httpReq.HasTopLevelExternalConfig() {
 		err := merr.WrapErrParameterInvalid("schema.externalSource/schema.externalSpec", "top-level externalSource/externalSpec",
 			"externalSource and externalSpec must be set under schema when creating an external collection")
-		log.Ctx(ctx).Warn("high level restful api, create external collection with top-level external config fail", zap.Error(err), zap.Any("request", anyReq))
+		mlog.Warn(ctx, "high level restful api, create external collection with top-level external config fail", mlog.Err(err), mlog.Any("request", anyReq))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(err),
 			HTTPReturnMessage: err.Error(),
@@ -2031,7 +2071,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		if httpReq.GetExternalSource() != "" || httpReq.GetExternalSpec() != "" {
 			err := merr.WrapErrParameterInvalid("schema.fields", "empty schema fields",
 				"external collection is not supported by quick create; provide schema.fields with externalField")
-			log.Ctx(ctx).Warn("high level restful api, quickly create external collection fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, quickly create external collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -2041,7 +2081,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		if len(httpReq.Schema.Functions) > 0 {
 			err := merr.WrapErrParameterInvalid("schema", "functions",
 				"functions are not supported for quickly create collection")
-			log.Ctx(ctx).Warn("high level restful api, quickly create collection fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, quickly create collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -2052,7 +2092,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		if httpReq.Dimension == 0 {
 			err := merr.WrapErrParameterInvalid("collectionName & dimension", "collectionName",
 				"dimension is required for quickly create collection(default metric type: "+DefaultMetricType+")")
-			log.Ctx(ctx).Warn("high level restful api, quickly create collection fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, quickly create collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -2074,7 +2114,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		default:
 			err := merr.WrapErrParameterInvalid("Int64, Varchar", httpReq.IDType,
 				"idType can only be [Int64, VarChar], default: Int64")
-			log.Ctx(ctx).Warn("high level restful api, quickly create collection fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, quickly create collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -2091,7 +2131,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		if enStr, ok := httpReq.Params["enableDynamicField"]; ok {
 			enableDynamic, err = strconv.ParseBool(fmt.Sprintf("%v", enStr))
 			if err != nil {
-				log.Ctx(ctx).Warn("high level restful api, parse enableDynamicField fail", zap.Error(err), zap.Any("request", anyReq))
+				mlog.Warn(ctx, "high level restful api, parse enableDynamicField fail", mlog.Err(err), mlog.Any("request", anyReq))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(err),
 					HTTPReturnMessage: "parse enableDynamicField fail, err:" + err.Error(),
@@ -2161,7 +2201,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		for _, field := range httpReq.Schema.Fields {
 			fieldDataType, ok := schemapb.DataType_value[field.DataType]
 			if !ok {
-				log.Ctx(ctx).Warn("field's data type is invalid(case sensitive).", zap.Any("fieldDataType", field.DataType), zap.Any("field", field))
+				mlog.Warn(ctx, "field's data type is invalid(case sensitive).", mlog.Any("fieldDataType", field.DataType), mlog.Any("field", field))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
 					HTTPReturnMessage: merr.ErrParameterInvalid.Error() + ", data type " + field.DataType + " is invalid(case sensitive).",
@@ -2182,7 +2222,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 
 			fieldSchema.DefaultValue, err = convertDefaultValue(field.DefaultValue, dataType)
 			if err != nil {
-				log.Ctx(ctx).Warn("convert defaultValue fail", zap.Any("defaultValue", field.DefaultValue))
+				mlog.Warn(ctx, "convert defaultValue fail", mlog.Any("defaultValue", field.DefaultValue))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(err),
 					HTTPReturnMessage: "convert defaultValue fail, err:" + err.Error(),
@@ -2191,7 +2231,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			}
 			if dataType == schemapb.DataType_Array {
 				if _, ok := schemapb.DataType_value[field.ElementDataType]; !ok {
-					log.Ctx(ctx).Warn("element's data type is invalid(case sensitive).", zap.Any("elementDataType", field.ElementDataType), zap.Any("field", field))
+					mlog.Warn(ctx, "element's data type is invalid(case sensitive).", mlog.Any("elementDataType", field.ElementDataType), mlog.Any("field", field))
 					HTTPAbortReturn(c, http.StatusOK, gin.H{
 						HTTPReturnCode:    merr.Code(merr.ErrParameterInvalid),
 						HTTPReturnMessage: merr.ErrParameterInvalid.Error() + ", element data type " + field.ElementDataType + " is invalid(case sensitive).",
@@ -2227,7 +2267,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			structField := httpReq.Schema.StructFields[i]
 			if _, dup := fieldNames[structField.FieldName]; dup {
 				err := merr.WrapErrParameterInvalidMsg("duplicated field name: %s", structField.FieldName)
-				log.Ctx(ctx).Warn("high level restful api, create collection fail", zap.Error(err), zap.Any("request", anyReq))
+				mlog.Warn(ctx, "high level restful api, create collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(err),
 					HTTPReturnMessage: err.Error(),
@@ -2236,8 +2276,8 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			}
 			structProto, err := structField.GetProto(ctx)
 			if err != nil {
-				log.Ctx(ctx).Warn("high level restful api, convert struct array field fail",
-					zap.String("structField", structField.FieldName), zap.Error(err))
+				mlog.Warn(ctx, "high level restful api, convert struct array field fail",
+					mlog.String("structField", structField.FieldName), mlog.Err(err))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(err),
 					HTTPReturnMessage: err.Error(),
@@ -2254,7 +2294,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		schema, err = proto.Marshal(&collSchema)
 	}
 	if err != nil {
-		log.Ctx(ctx).Warn("high level restful api, marshal collection schema fail", zap.Error(err), zap.Any("request", anyReq))
+		mlog.Warn(ctx, "high level restful api, marshal collection schema fail", mlog.Err(err), mlog.Any("request", anyReq))
 		HTTPAbortReturn(c, http.StatusOK, gin.H{
 			HTTPReturnCode:    merr.Code(merr.ErrMarshalCollectionSchema),
 			HTTPReturnMessage: merr.ErrMarshalCollectionSchema.Error() + ", error: " + err.Error(),
@@ -2278,7 +2318,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 		} else {
 			err := merr.WrapErrParameterInvalid("Strong, Session, Bounded, Eventually, Customized", httpReq.Params["consistencyLevel"],
 				"consistencyLevel can only be [Strong, Session, Bounded, Eventually, Customized], default: Bounded")
-			log.Ctx(ctx).Warn("high level restful api, create collection fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, create collection fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -2291,7 +2331,32 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 	if partitionsNum > 0 {
 		req.NumPartitions = partitionsNum
 	}
+	ttlPropertySet := false
+	for _, propertyKey := range []string{common.CollectionTTLConfigKey, "ttl.seconds"} {
+		value, ok := httpReq.Properties[propertyKey]
+		if !ok {
+			continue
+		}
+		if ttlPropertySet {
+			err := merr.WrapErrParameterInvalidMsg("collection TTL is specified multiple times")
+			HTTPAbortReturn(c, http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error(),
+			})
+			return nil, err
+		}
+		ttlPropertySet = true
+		req.Properties = append(req.Properties, &commonpb.KeyValuePair{Key: common.CollectionTTLConfigKey, Value: fmt.Sprintf("%v", value)})
+	}
 	if _, ok := httpReq.Params["ttlSeconds"]; ok {
+		if ttlPropertySet {
+			err := merr.WrapErrParameterInvalidMsg("collection TTL is specified multiple times")
+			HTTPAbortReturn(c, http.StatusOK, gin.H{
+				HTTPReturnCode:    merr.Code(err),
+				HTTPReturnMessage: err.Error(),
+			})
+			return nil, err
+		}
 		req.Properties = append(req.Properties, &commonpb.KeyValuePair{
 			Key:   common.CollectionTTLConfigKey,
 			Value: fmt.Sprintf("%v", httpReq.Params["ttlSeconds"]),
@@ -2375,7 +2440,7 @@ func (h *HandlersV2) createCollection(ctx context.Context, c *gin.Context, anyRe
 			createIndexReq.ExtraParams, err = convertToExtraParams(indexParam)
 			if err != nil {
 				// will not happen
-				log.Ctx(ctx).Warn("high level restful api, convertToExtraParams fail", zap.Error(err), zap.Any("request", anyReq))
+				mlog.Warn(ctx, "high level restful api, convertToExtraParams fail", mlog.Err(err), mlog.Any("request", anyReq))
 				HTTPAbortReturn(c, http.StatusOK, gin.H{
 					HTTPReturnCode:    merr.Code(err),
 					HTTPReturnMessage: err.Error(),
@@ -3099,7 +3164,7 @@ func (h *HandlersV2) createIndex(ctx context.Context, c *gin.Context, anyReq any
 		req.ExtraParams, err = convertToExtraParams(indexParam)
 		if err != nil {
 			// will not happen
-			log.Ctx(ctx).Warn("high level restful api, convertToExtraParams fail", zap.Error(err), zap.Any("request", anyReq))
+			mlog.Warn(ctx, "high level restful api, convertToExtraParams fail", mlog.Err(err), mlog.Any("request", anyReq))
 			HTTPAbortReturn(c, http.StatusOK, gin.H{
 				HTTPReturnCode:    merr.Code(err),
 				HTTPReturnMessage: err.Error(),
@@ -3364,64 +3429,208 @@ func (h *HandlersV2) createImportJob(ctx context.Context, c *gin.Context, anyReq
 
 func (h *HandlersV2) getImportJobProcess(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
 	jobIDGetter := anyReq.(JobIDGetter)
+	response, err := h.getImportProgress(ctx, c, dbName, jobIDGetter.GetJobID())
+	if err != nil {
+		return response, err
+	}
+	if err := h.checkImportPrivilege(ctx, c, dbName, response.GetCollectionName()); err != nil {
+		return nil, err
+	}
+
+	returnData := make(map[string]interface{})
+	returnData["jobId"] = jobIDGetter.GetJobID()
+	returnData["createTime"] = response.GetCreateTime()
+	returnData["collectionName"] = response.GetCollectionName()
+	returnData["completeTime"] = response.GetCompleteTime()
+	returnData["state"] = response.GetState().String()
+	returnData["progress"] = response.GetProgress()
+	returnData["importedRows"] = response.GetImportedRows()
+	returnData["totalRows"] = response.GetTotalRows()
+	reason := response.GetReason()
+	if reason != "" {
+		returnData["reason"] = reason
+	}
+	details := make([]map[string]interface{}, 0)
+	totalFileSize := int64(0)
+	for _, taskProgress := range response.GetTaskProgresses() {
+		detail := make(map[string]interface{})
+		detail["fileName"] = taskProgress.GetFileName()
+		detail["fileSize"] = taskProgress.GetFileSize()
+		detail["progress"] = taskProgress.GetProgress()
+		detail["completeTime"] = taskProgress.GetCompleteTime()
+		detail["state"] = taskProgress.GetState()
+		detail["importedRows"] = taskProgress.GetImportedRows()
+		detail["totalRows"] = taskProgress.GetTotalRows()
+		reason = taskProgress.GetReason()
+		if reason != "" {
+			detail["reason"] = reason
+		}
+		details = append(details, detail)
+		totalFileSize += taskProgress.GetFileSize()
+	}
+	returnData["fileSize"] = totalFileSize
+	returnData["details"] = details
+	HTTPReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(nil), HTTPReturnData: returnData})
+	return response, nil
+}
+
+func (h *HandlersV2) getImportProgress(ctx context.Context, c *gin.Context, dbName string, jobID string) (*internalpb.GetImportProgressResponse, error) {
 	req := &internalpb.GetImportProgressRequest{
 		DbName: dbName,
-		JobID:  jobIDGetter.GetJobID(),
+		JobID:  jobID,
 	}
 	c.Set(ContextRequest, req)
 
 	resp, err := wrapperProxy(ctx, c, req, false, false, "/milvus.proto.milvus.MilvusService/GetImportProgress", func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.GetImportProgress(reqCtx, req.(*internalpb.GetImportProgressRequest))
 	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.(*internalpb.GetImportProgressResponse), nil
+}
+
+func (h *HandlersV2) checkImportPrivilege(ctx context.Context, c *gin.Context, dbName string, collectionName string) error {
+	if !h.checkAuth {
+		return nil
+	}
+
+	authErr := checkAuthorizationHelper(ctx, c, &milvuspb.ImportAuthPlaceholder{
+		DbName:         dbName,
+		CollectionName: collectionName,
+	})
+	if authErr != nil {
+		HTTPReturn(c, http.StatusForbidden, gin.H{
+			HTTPReturnCode:    merr.Code(authErr),
+			HTTPReturnMessage: authErr.Error(),
+		})
+		return authErr
+	}
+	return nil
+}
+
+func (h *HandlersV2) checkImportJobAuth(ctx context.Context, c *gin.Context, dbName string, jobID string) error {
+	if !h.checkAuth {
+		return nil
+	}
+
+	// Commit/abort requests only carry jobID. Import privilege is collection-scoped,
+	// so resolve the job's collection before checking PrivilegeImport.
+	response, err := h.getImportProgress(ctx, c, dbName, jobID)
+	if err != nil {
+		return err
+	}
+	return h.checkImportPrivilege(ctx, c, dbName, response.GetCollectionName())
+}
+
+func (h *HandlersV2) restoreExternalSnapshot(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*RestoreExternalSnapshotReq)
+	req := &milvuspb.RestoreExternalSnapshotRequest{
+		DbName:               dbName,
+		TargetCollectionName: httpReq.TargetCollectionName,
+		SnapshotMetadataUri:  httpReq.SnapshotMetadataURI,
+		ExternalSpec:         httpReq.ExternalSpec,
+	}
+	c.Set(ContextRequest, req)
+
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/RestoreExternalSnapshot", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.RestoreExternalSnapshot(reqCtx, req.(*milvuspb.RestoreExternalSnapshotRequest))
+	})
 	if err == nil {
-		response := resp.(*internalpb.GetImportProgressResponse)
-		if h.checkAuth {
-			err := checkAuthorizationHelper(ctx, c, &milvuspb.ImportAuthPlaceholder{
-				DbName:         dbName,
-				CollectionName: response.GetCollectionName(),
-			})
-			if err != nil {
-				HTTPReturn(c, http.StatusForbidden, gin.H{
-					HTTPReturnCode:    merr.Code(err),
-					HTTPReturnMessage: err.Error(),
-				})
-				return nil, err
-			}
+		HTTPReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode: merr.Code(nil),
+			HTTPReturnData: gin.H{"jobId": resp.(*milvuspb.RestoreExternalSnapshotResponse).GetJobId()},
+		})
+	}
+	return resp, err
+}
+
+func (h *HandlersV2) exportSnapshot(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*ExportSnapshotReq)
+	req := &milvuspb.ExportSnapshotRequest{
+		DbName:         dbName,
+		CollectionName: httpReq.CollectionName,
+		Name:           httpReq.Name,
+		TargetS3Path:   httpReq.TargetS3Path,
+		ExternalSpec:   httpReq.ExternalSpec,
+	}
+	c.Set(ContextRequest, req)
+
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/ExportSnapshot", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.ExportSnapshot(reqCtx, req.(*milvuspb.ExportSnapshotRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode: merr.Code(nil),
+			HTTPReturnData: gin.H{"snapshotMetadataURI": resp.(*milvuspb.ExportSnapshotResponse).GetSnapshotMetadataUri()},
+		})
+	}
+	return resp, err
+}
+
+func restoreSnapshotJobToREST(info *milvuspb.RestoreSnapshotInfo) gin.H {
+	if info == nil {
+		return gin.H{}
+	}
+	return gin.H{
+		"jobId":          info.GetJobId(),
+		"snapshotName":   info.GetSnapshotName(),
+		"dbName":         info.GetDbName(),
+		"collectionName": info.GetCollectionName(),
+		"state":          info.GetState().String(),
+		"progress":       info.GetProgress(),
+		"reason":         info.GetReason(),
+		"startTime":      info.GetStartTime(),
+		"timeCost":       info.GetTimeCost(),
+	}
+}
+
+func (h *HandlersV2) getRestoreSnapshotState(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*JobIDReq)
+	jobID, err := strconv.ParseInt(httpReq.GetJobID(), 10, 64)
+	if err != nil {
+		paramErr := merr.WrapErrParameterInvalid("int64 jobId", httpReq.GetJobID(), err.Error())
+		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(paramErr), HTTPReturnMessage: paramErr.Error()})
+		return nil, paramErr
+	}
+	req := &milvuspb.GetRestoreSnapshotStateRequest{
+		Base:  commonpbutil.NewMsgBase(),
+		JobId: jobID,
+	}
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/GetRestoreSnapshotState", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.GetRestoreSnapshotState(reqCtx, req.(*milvuspb.GetRestoreSnapshotStateRequest))
+	})
+	if err == nil {
+		HTTPReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode: merr.Code(nil),
+			HTTPReturnData: restoreSnapshotJobToREST(resp.(*milvuspb.GetRestoreSnapshotStateResponse).GetInfo()),
+		})
+	}
+	return resp, err
+}
+
+func (h *HandlersV2) listRestoreSnapshotJobs(ctx context.Context, c *gin.Context, anyReq any, dbName string) (interface{}, error) {
+	httpReq := anyReq.(*OptionalCollectionNameReq)
+	req := &milvuspb.ListRestoreSnapshotJobsRequest{
+		Base:           commonpbutil.NewMsgBase(),
+		DbName:         dbName,
+		CollectionName: httpReq.GetCollectionName(),
+	}
+	c.Set(ContextRequest, req)
+	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/ListRestoreSnapshotJobs", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
+		return h.proxy.ListRestoreSnapshotJobs(reqCtx, req.(*milvuspb.ListRestoreSnapshotJobsRequest))
+	})
+	if err == nil {
+		jobs := resp.(*milvuspb.ListRestoreSnapshotJobsResponse).GetJobs()
+		records := make([]gin.H, 0, len(jobs))
+		for _, info := range jobs {
+			records = append(records, restoreSnapshotJobToREST(info))
 		}
-		returnData := make(map[string]interface{})
-		returnData["jobId"] = jobIDGetter.GetJobID()
-		returnData["createTime"] = response.GetCreateTime()
-		returnData["collectionName"] = response.GetCollectionName()
-		returnData["completeTime"] = response.GetCompleteTime()
-		returnData["state"] = response.GetState().String()
-		returnData["progress"] = response.GetProgress()
-		returnData["importedRows"] = response.GetImportedRows()
-		returnData["totalRows"] = response.GetTotalRows()
-		reason := response.GetReason()
-		if reason != "" {
-			returnData["reason"] = reason
-		}
-		details := make([]map[string]interface{}, 0)
-		totalFileSize := int64(0)
-		for _, taskProgress := range response.GetTaskProgresses() {
-			detail := make(map[string]interface{})
-			detail["fileName"] = taskProgress.GetFileName()
-			detail["fileSize"] = taskProgress.GetFileSize()
-			detail["progress"] = taskProgress.GetProgress()
-			detail["completeTime"] = taskProgress.GetCompleteTime()
-			detail["state"] = taskProgress.GetState()
-			detail["importedRows"] = taskProgress.GetImportedRows()
-			detail["totalRows"] = taskProgress.GetTotalRows()
-			reason = taskProgress.GetReason()
-			if reason != "" {
-				detail["reason"] = reason
-			}
-			details = append(details, detail)
-			totalFileSize += taskProgress.GetFileSize()
-		}
-		returnData["fileSize"] = totalFileSize
-		returnData["details"] = details
-		HTTPReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(nil), HTTPReturnData: returnData})
+		HTTPReturn(c, http.StatusOK, gin.H{
+			HTTPReturnCode: merr.Code(nil),
+			HTTPReturnData: gin.H{"records": records},
+		})
 	}
 	return resp, err
 }
@@ -3455,6 +3664,9 @@ func (h *HandlersV2) commitImportJob(ctx context.Context, c *gin.Context, anyReq
 		paramErr := merr.WrapErrParameterInvalid("int64 jobId", jobIDGetter.GetJobID(), err.Error())
 		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(paramErr), HTTPReturnMessage: paramErr.Error()})
 		return nil, paramErr
+	}
+	if err := h.checkImportJobAuth(ctx, c, dbName, jobIDGetter.GetJobID()); err != nil {
+		return nil, err
 	}
 	req := &datapb.CommitImportRequest{
 		Base:  commonpbutil.NewMsgBase(),
@@ -3498,6 +3710,9 @@ func (h *HandlersV2) abortImportJob(ctx context.Context, c *gin.Context, anyReq 
 		paramErr := merr.WrapErrParameterInvalid("int64 jobId", jobIDGetter.GetJobID(), err.Error())
 		HTTPAbortReturn(c, http.StatusOK, gin.H{HTTPReturnCode: merr.Code(paramErr), HTTPReturnMessage: paramErr.Error()})
 		return nil, paramErr
+	}
+	if err := h.checkImportJobAuth(ctx, c, dbName, jobIDGetter.GetJobID()); err != nil {
+		return nil, err
 	}
 	req := &datapb.AbortImportRequest{
 		Base:  commonpbutil.NewMsgBase(),

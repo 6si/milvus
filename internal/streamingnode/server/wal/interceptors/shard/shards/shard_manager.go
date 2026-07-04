@@ -7,7 +7,6 @@ import (
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
-	"go.uber.org/zap"
 
 	"github.com/milvus-io/milvus/internal/streamingnode/server/resource"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal"
@@ -15,13 +14,17 @@ import (
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/metricsutil"
 	"github.com/milvus-io/milvus/internal/streamingnode/server/wal/recovery"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
+	"github.com/milvus-io/milvus/pkg/v3/mlog"
 	"github.com/milvus-io/milvus/pkg/v3/proto/streamingpb"
 	"github.com/milvus-io/milvus/pkg/v3/streaming/util/types"
 	"github.com/milvus-io/milvus/pkg/v3/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v3/util/syncutil"
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
+
+// latestCollectionSchemaVersion asks GetCollectionSchema to use the latest
+// schema snapshot. Zero is a valid schema version and must stay explicit.
+const latestCollectionSchemaVersion int32 = -1
 
 var (
 	ErrCollectionExists                = errors.New("collection exists")
@@ -58,7 +61,7 @@ func RecoverShardManager(param *ShardManagerRecoverParam) ShardManager {
 	partitionToSegmentManagers, segmentBelongs := newSegmentAllocManagersFromRecovery(param.ChannelInfo, param.InitialRecoverSnapshot, collections)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	logger := resource.Resource().Logger().With(log.FieldComponent("shard-manager")).With(zap.Stringer("pchannel", param.ChannelInfo))
+	logger := resource.Resource().Logger().With(mlog.FieldComponent("shard-manager")).With(mlog.Stringer("pchannel", param.ChannelInfo))
 	// create managers list.
 	managers := make(map[PartitionUniqueKey]*partitionManager)
 	segmentTotal := 0
@@ -191,7 +194,7 @@ func newCollectionInfos(recoverInfos *recovery.RecoverySnapshot) map[int64]*Coll
 // It's a in-memory data structure, and will be recovered from recovery stroage of wal and wal itself.
 // !!! Don't add any block operation (such as rpc or meta opration) in this module.
 type shardManagerImpl struct {
-	log.Binder
+	mlog.Binder
 
 	mu                sync.Mutex
 	ctx               context.Context

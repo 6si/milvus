@@ -30,6 +30,8 @@
 #include "common/Schema.h"
 #include "common/Types.h"
 #include "common/protobuf_utils.h"
+#include "index/IndexFactory.h"
+#include "index/Meta.h"
 #include "milvus-storage/column_groups.h"
 #include "pb/common.pb.h"
 #include "pb/index_cgo_msg.pb.h"
@@ -414,15 +416,19 @@ class SegmentLoadInfo {
 
     /**
      * @brief Copy constructor
-     * @note Rebuilds cache instead of copying (LoadIndexInfo is not copyable)
+     * @note Reuses converted index metadata; binlog pointers are rebuilt for
+     *       this instance's protobuf storage.
      */
     SegmentLoadInfo(const SegmentLoadInfo& other)
         : info_(other.info_),
           schema_(other.schema_),
-          column_groups_(other.column_groups_),
+          converted_index_infos_(other.converted_index_infos_),
+          converted_field_index_cache_(other.converted_field_index_cache_),
+          field_index_has_raw_data_(other.field_index_has_raw_data_),
           fields_filled_with_default_(other.fields_filled_with_default_),
+          column_groups_(other.column_groups_),
           created_text_indexes_(other.created_text_indexes_) {
-        BuildCache();
+        BuildFieldBinlogCache();
     }
 
     /**
@@ -444,17 +450,21 @@ class SegmentLoadInfo {
 
     /**
      * @brief Copy assignment operator
-     * @note Rebuilds cache instead of copying (LoadIndexInfo is not copyable)
+     * @note Reuses converted index metadata; binlog pointers are rebuilt for
+     *       this instance's protobuf storage.
      */
     SegmentLoadInfo&
     operator=(const SegmentLoadInfo& other) {
         if (this != &other) {
             info_ = other.info_;
             schema_ = other.schema_;
+            converted_index_infos_ = other.converted_index_infos_;
+            converted_field_index_cache_ = other.converted_field_index_cache_;
+            field_index_has_raw_data_ = other.field_index_has_raw_data_;
             column_groups_ = other.column_groups_;
             fields_filled_with_default_ = other.fields_filled_with_default_;
             created_text_indexes_ = other.created_text_indexes_;
-            BuildCache();
+            BuildFieldBinlogCache();
         }
         return *this;
     }
@@ -1072,7 +1082,7 @@ class SegmentLoadInfo {
 
  private:
     void
-    BuildCache() {
+    BuildFieldBinlogCache() {
         field_binlog_cache_.clear();
         // Build binlog cache
         for (int i = 0; i < info_.binlog_paths_size(); i++) {
@@ -1080,6 +1090,11 @@ class SegmentLoadInfo {
             auto field_id = FieldId(binlog.fieldid());
             field_binlog_cache_[field_id] = &binlog;
         }
+    }
+
+    void
+    BuildCache() {
+        BuildFieldBinlogCache();
 
         // Convert index infos to LoadIndexInfo and build per-field cache
         converted_index_infos_.clear();
@@ -1096,6 +1111,24 @@ class SegmentLoadInfo {
             }
             auto load_index_info = ConvertFieldIndexInfoToLoadIndexInfo(
                 &index_info, info_.segmentid());
+            auto index_type_it =
+                load_index_info.index_params.find(milvus::index::INDEX_TYPE);
+            auto needs_file_context =
+                !IsVectorDataType(load_index_info.field_type) &&
+                index_type_it != load_index_info.index_params.end() &&
+                index_type_it->second == milvus::index::HYBRID_INDEX_TYPE;
+            if (!needs_file_context) {
+                load_index_info.load_resource_request =
+                    milvus::index::IndexFactory::GetInstance()
+                        .IndexLoadResource(load_index_info.field_type,
+                                           load_index_info.element_type,
+                                           load_index_info.index_engine_version,
+                                           load_index_info.index_size,
+                                           load_index_info.index_params,
+                                           load_index_info.enable_mmap,
+                                           load_index_info.num_rows,
+                                           load_index_info.dim);
+            }
             converted_index_infos_.push_back(load_index_info);
             // Check if index has raw data before moving
             if (CheckIndexHasRawData(load_index_info)) {
