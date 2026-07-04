@@ -505,7 +505,7 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 		for _, indexInfo := range info.GetIndexInfos() {
 			idxParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
 			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), idxParams); err != nil {
-				log.Warn("failed to apply load-stage overrides", zap.Error(err))
+				mlog.Warn(ctx, "failed to apply load-stage overrides", mlog.Err(err))
 				return merr.Status(err), nil
 			}
 			indexInfo.IndexParams = funcutil.Map2KeyValuePair(idxParams)

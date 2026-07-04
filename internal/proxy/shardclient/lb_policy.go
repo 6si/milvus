@@ -376,9 +376,9 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 		log.Warn(ctx, "failed to get shards", mlog.Err(err))
 		return err
 	}
-	log.Info("GPU_TIMING lb_get_shard_leaders",
-		zap.Duration("duration", time.Since(shardLeaderStart)),
-		zap.Int("num_channels", len(channelList)))
+	log.Info(ctx, "GPU_TIMING lb_get_shard_leaders",
+		mlog.Duration("duration", time.Since(shardLeaderStart)),
+		mlog.Int("num_channels", len(channelList)))
 
 	if len(channelList) == 0 {
 		log.Info(ctx, "no shard leaders found", mlog.Int64("collectionID", workload.CollectionID))
@@ -397,9 +397,9 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			Exec:            workload.Exec,
 			PreferredNodeID: preferredNodeID(workload, channelList[0]),
 		})
-		log.Info("GPU_TIMING lb_fan_out",
-			zap.Duration("duration", time.Since(fanOutStart)),
-			zap.Int("num_channels", 1))
+		log.Info(ctx, "GPU_TIMING lb_fan_out",
+			mlog.Duration("duration", time.Since(fanOutStart)),
+			mlog.Int("num_channels", 1))
 		return err
 	}
 
@@ -418,9 +418,9 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 		})
 	}
 	err = wg.Wait()
-	log.Info("GPU_TIMING lb_fan_out",
-		zap.Duration("duration", time.Since(fanOutStart)),
-		zap.Int("num_channels", len(channelList)))
+	log.Info(ctx, "GPU_TIMING lb_fan_out",
+		mlog.Duration("duration", time.Since(fanOutStart)),
+		mlog.Int("num_channels", len(channelList)))
 	return err
 }
 

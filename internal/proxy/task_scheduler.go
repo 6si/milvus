@@ -573,8 +573,8 @@ func (sched *taskScheduler) processTask(t task, q taskQueue) {
 		WithLabelValues(strconv.FormatInt(paramtable.GetNodeID(), 10), t.Type().String()).
 		Observe(float64(waitDuration.Microseconds()) / 1000.0)
 	if t.Name() == "SearchTask" {
-		log.Ctx(ctx).Info("GPU_TIMING proxy_queue_wait",
-			zap.Duration("duration", waitDuration))
+		mlog.Info(ctx, "GPU_TIMING proxy_queue_wait",
+			mlog.Duration("duration", waitDuration))
 	}
 
 	err := t.PreExecute(ctx)
