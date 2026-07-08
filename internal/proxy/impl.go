@@ -2959,7 +2959,6 @@ func (node *Proxy) Search(ctx context.Context, request *milvuspb.SearchRequest) 
 }
 
 func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest, optimizedSearch bool, isRecallEvaluation bool) (*milvuspb.SearchResults, bool, bool, bool, error) {
-	proxySearchStart := time.Now()
 	metrics.GetStats(ctx).
 		SetNodeID(paramtable.GetNodeID()).
 		SetInboundLabel(metrics.SearchLabel).
@@ -3061,7 +3060,6 @@ func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest, 
 
 	mlog.Debug(ctx, rpcReceived(method))
 
-	enqueueStart := time.Now()
 	if err := node.sched.dqQueue.Enqueue(qt); err != nil {
 		mlog.Warn(ctx,
 			rpcFailedToEnqueue(method),
@@ -3072,8 +3070,6 @@ func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest, 
 			Status: merr.Status(err),
 		}, false, false, false, nil
 	}
-	mlog.Info(ctx, "GPU_TIMING proxy_enqueue",
-		mlog.Duration("duration", time.Since(enqueueStart)))
 	tr.CtxRecord(ctx, "search request enqueue")
 
 	mlog.Debug(ctx,
@@ -3103,10 +3099,6 @@ func (node *Proxy) search(ctx context.Context, request *milvuspb.SearchRequest, 
 	).Observe(float64(span.Milliseconds()))
 
 	tr.CtxRecord(ctx, "wait search result")
-	mlog.Info(ctx, "GPU_TIMING proxy_search_total",
-		mlog.Duration("duration", time.Since(proxySearchStart)),
-		mlog.Int64("nq", qt.GetNq()),
-		mlog.String("collection", collectionName))
 	mlog.Debug(ctx, rpcDone(method))
 
 	metrics.ProxySearchVectors.

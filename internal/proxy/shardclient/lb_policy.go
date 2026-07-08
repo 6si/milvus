@@ -20,7 +20,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/samber/lo"
@@ -370,22 +369,17 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 	log := mlog.With(
 		mlog.Int64("collectionID", workload.CollectionID),
 	)
-	shardLeaderStart := time.Now()
 	channelList, err := lb.GetShardLeaderList(ctx, workload.Db, workload.CollectionName, workload.CollectionID, true)
 	if err != nil {
 		log.Warn(ctx, "failed to get shards", mlog.Err(err))
 		return err
 	}
-	log.Info(ctx, "GPU_TIMING lb_get_shard_leaders",
-		mlog.Duration("duration", time.Since(shardLeaderStart)),
-		mlog.Int("num_channels", len(channelList)))
 
 	if len(channelList) == 0 {
 		log.Info(ctx, "no shard leaders found", mlog.Int64("collectionID", workload.CollectionID))
 		return merr.WrapErrCollectionNotLoaded(workload.CollectionID)
 	}
 
-	fanOutStart := time.Now()
 	// Single channel fast path: skip errgroup/goroutine overhead
 	if len(channelList) == 1 {
 		err := lb.ExecuteWithRetry(ctx, ChannelWorkload{
@@ -397,9 +391,6 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			Exec:            workload.Exec,
 			PreferredNodeID: preferredNodeID(workload, channelList[0]),
 		})
-		log.Info(ctx, "GPU_TIMING lb_fan_out",
-			mlog.Duration("duration", time.Since(fanOutStart)),
-			mlog.Int("num_channels", 1))
 		return err
 	}
 
@@ -418,9 +409,6 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 		})
 	}
 	err = wg.Wait()
-	log.Info(ctx, "GPU_TIMING lb_fan_out",
-		mlog.Duration("duration", time.Since(fanOutStart)),
-		mlog.Int("num_channels", len(channelList)))
 	return err
 }
 
