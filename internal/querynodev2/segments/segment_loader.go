@@ -257,6 +257,19 @@ func (loader *segmentLoader) Load(ctx context.Context,
 	var err error
 	var requestResourceResult requestResourceResult
 
+	// Apply override_index_type before resource estimation so GPU_HNSW's
+	// StaticEstimateLoadResource (memoryCost=0) is used instead of the
+	// default HNSW estimate (memoryCost=file_size).
+	for _, info := range infos {
+		for _, indexInfo := range info.IndexInfos {
+			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+				return nil, err
+			}
+			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
+		}
+	}
+
 	// Check memory & storage limit
 	// no need to check resource for lazy load here
 	requestResourceResult, err = loader.requestResource(ctx, infos...)
@@ -2582,6 +2595,17 @@ func (loader *segmentLoader) ReopenSegments(ctx context.Context,
 		collection := loader.manager.Collection.Get(info.GetCollectionID())
 		if collection != nil {
 			configureUseTakeForOutput(info, collection.Schema())
+		}
+
+		// Apply knowhere load-stage overrides (e.g. override_index_type) to index params
+		// before passing to C++. Without this, segments reopened for index updates would
+		// use the original index_type (e.g. HNSW) instead of the configured override (e.g. GPU_HNSW).
+		for _, indexInfo := range info.GetIndexInfos() {
+			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+				return err
+			}
+			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
 		}
 
 		err := segment.Reopen(ctx, info)
