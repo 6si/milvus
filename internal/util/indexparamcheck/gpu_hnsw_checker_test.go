@@ -194,13 +194,16 @@ func Test_gpuHnswChecker_CheckValidDataType(t *testing.T) {
 			dType:    schemapb.DataType_FloatVector,
 			errIsNil: true,
 		},
+		// GPU_HNSW is registered in knowhere only for FLOAT32 (GPU_ANN_FLOAT_INDEX
+		// = FLOAT32 | GPU) and INT8; it does NOT support FP16/BF16, so those must
+		// be rejected. (Earlier drafts falsely claimed fp16/bf16 support.)
 		{
 			dType:    schemapb.DataType_Float16Vector,
-			errIsNil: true,
+			errIsNil: false,
 		},
 		{
 			dType:    schemapb.DataType_BFloat16Vector,
-			errIsNil: true,
+			errIsNil: false,
 		},
 		{
 			dType:    schemapb.DataType_Int8Vector,
