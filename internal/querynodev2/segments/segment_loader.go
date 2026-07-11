@@ -2594,6 +2594,24 @@ func (loader *segmentLoader) ReopenSegments(ctx context.Context,
 	infos := loader.prepare(ctx, commonpb.SegmentState_SegmentStateNone, loadInfos...)
 	defer loader.unregister(infos...)
 
+	// Apply knowhere load-stage overrides (e.g. override_index_type) before
+	// resource estimation so GPU_HNSW's StaticEstimateLoadResource
+	// (memoryCost=0) is used instead of the default HNSW estimate
+	// (memoryCost=file_size). This mirrors the Load()/LoadIndex() ordering;
+	// applying it after requestResource would size the budget with the CPU
+	// index type and could spuriously reject a GPU reopen with insufficient
+	// memory. AppendPrepareLoadParams is idempotent, so segment.Reopen below
+	// receives the same overridden params.
+	for _, info := range infos {
+		for _, indexInfo := range info.GetIndexInfos() {
+			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+				return err
+			}
+			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
+		}
+	}
+
 	// use full resource in case of whole segment reopen
 	// TODO use calculated resource from segcore after supported
 	requestResourceResult, err := loader.requestResource(ctx, infos...)
@@ -2612,17 +2630,6 @@ func (loader *segmentLoader) ReopenSegments(ctx context.Context,
 		collection := loader.manager.Collection.Get(info.GetCollectionID())
 		if collection != nil {
 			configureUseTakeForOutput(info, collection.Schema())
-		}
-
-		// Apply knowhere load-stage overrides (e.g. override_index_type) to index params
-		// before passing to C++. Without this, segments reopened for index updates would
-		// use the original index_type (e.g. HNSW) instead of the configured override (e.g. GPU_HNSW).
-		for _, indexInfo := range info.GetIndexInfos() {
-			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
-			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
-				return err
-			}
-			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
 		}
 
 		err := segment.Reopen(ctx, info)
