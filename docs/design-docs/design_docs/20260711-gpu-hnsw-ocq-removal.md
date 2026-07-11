@@ -151,7 +151,8 @@ This is additive and non-destructive (preserves Milvus's existing API/tests)
 rather than dropping the type. If a distinct SQ-specific backend is ever needed,
 the subclass is the extension point.
 
-Registered for `VECTOR_FLOAT` and `VECTOR_INT8` (matching `GPU_HNSW`).
+Registered for `VECTOR_FLOAT`, `VECTOR_FLOAT16`, `VECTOR_BFLOAT16` and
+`VECTOR_INT8` (matching `GPU_HNSW`; see the native FP16/BF16 decision below).
 
 ## Go param checker (GPU_HNSW / GPU_HNSW_SQ)
 
@@ -164,3 +165,45 @@ unified-checker short-circuit. The checker unit tests, which previously
 silently `return`ed (reported PASS) when `GetChecker` yielded nil, now `t.Skip`
 honestly on non-GPU builds and a pure-Go routing test asserts the correct
 checker type is returned.
+
+# Related Decision: Native FP16 / BF16 support
+
+## Context
+
+GPU_HNSW initially supported only FP32 (HNSW-Flat) and INT8 (HNSW_SQ
+`QT_8bit_direct_signed`). FP16/BF16 collections were rejected at the Milvus
+checker (knowhere advertised only `FLOAT32|GPU` and `INT8|GPU`). INT8 already
+had a *native* device path — 1 byte/element on the GPU, a dedicated `load_elem`
+that up-converts to fp32 for accumulation — so FP16/BF16 were the only
+low-precision float formats missing, and CPU HNSW already supports both.
+
+Two options were weighed:
+- **Decode-to-fp32 on upload:** zero CUDA kernel work (reuses the fp32 path),
+  but the device buffer is fp32 — a fp16 collection would cost the *same* VRAM
+  as fp32, defeating the reason to pick fp16.
+- **Native low-precision storage (chosen):** mirror the INT8 precedent — store
+  fp16/bf16 at 2 bytes/element on the device and up-convert per element in the
+  kernel. Preserves the memory win and is consistent with how INT8 works.
+
+## Decision
+
+Implement **native** FP16/BF16. faiss stores fp16/bf16 HNSW_SQ codes
+(`QT_fp16`/`QT_bf16`) row-major as raw IEEE half / bfloat16, `code_size = d*2`,
+which are bit-compatible with CUDA `half` / `__nv_bfloat16`. The upload path
+(`from_faiss_hnsw_sq` → `upload_halfwidth_dataset`) copies those bytes verbatim
+to the device; the search kernel dispatches on a new `GpuHnswDatasetType` enum
+(`FP32`/`INT8`/`FP16`/`BF16`) and the templated distance helpers select the
+matching `load_elem` overload (`__half2float` / `__bfloat162float`). Cosine
+inverse-L2-norms are computed from the fp32-decoded values and applied at search
+time, mirroring the INT8 path (stored codes are not normalized). The graph-walk
+algorithm is unchanged. Knowhere registers FP16/BF16 for both GPU_HNSW and
+GPU_HNSW_SQ (`feature::FP16|GPU`, `feature::BF16|GPU`); the Milvus checker then
+auto-accepts them through the cgo feature flags (no Go logic change).
+
+## Verification status
+
+The CUDA changes are **compile-verified only** (this environment has no GPU
+runtime). The added Knowhere unit tests (`Test GPU HNSW FP16/BF16
+Deserialization`) and GPU recall/latency/VRAM behavior require a real GPU eval,
+which is pending capacity — GPU-runtime correctness is therefore **not yet
+validated**.
