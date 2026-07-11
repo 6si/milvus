@@ -5,12 +5,39 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/internal/util/vecindexmgr"
 	"github.com/milvus-io/milvus/pkg/v3/common"
-	"github.com/milvus-io/milvus/pkg/v3/log"
 	"github.com/milvus-io/milvus/pkg/v3/util/metric"
 )
+
+// requireGpuHnswChecker returns the GPU_HNSW checker, or skips the test when the
+// linked core was built without GPU_HNSW (no GPU/CUVS). A skip is honest; the
+// previous silent `return` reported a PASS and gave false confidence.
+func requireGpuHnswChecker(t *testing.T) IndexChecker {
+	if !vecindexmgr.GetVecIndexMgrInstance().IsVecIndex("GPU_HNSW") {
+		t.Skip("GPU_HNSW not registered in this build (no GPU/CUVS); skipping")
+	}
+	c, err := GetIndexCheckerMgrInstance().GetChecker("GPU_HNSW")
+	require.NoError(t, err)
+	require.NotNil(t, c)
+	return c
+}
+
+func Test_gpuHnswChecker_routing(t *testing.T) {
+	// GPU_HNSW / GPU_HNSW_SQ must resolve to the dedicated gpuHnswChecker so the
+	// M/efConstruction range validation actually runs (knowhere's
+	// ValidateIndexParams is a no-op for these types).
+	for _, it := range []string{"GPU_HNSW", "GPU_HNSW_SQ"} {
+		c, err := GetIndexCheckerMgrInstance().GetChecker(it)
+		require.NoError(t, err)
+		require.NotNil(t, c)
+		_, ok := c.(*gpuHnswChecker)
+		require.Truef(t, ok, "expected *gpuHnswChecker for %s, got %T", it, c)
+	}
+}
 
 func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 	validParams := map[string]string{
@@ -102,11 +129,7 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 		{p8, true},  // 384-d COSINE
 	}
 
-	c, err := GetIndexCheckerMgrInstance().GetChecker("GPU_HNSW")
-	if c == nil || err != nil {
-		log.Error("can not get GPU_HNSW index checker instance, please enable GPU and rerun it")
-		return
-	}
+	c := requireGpuHnswChecker(t)
 	for _, test := range cases {
 		test.params[common.IndexTypeKey] = "GPU_HNSW"
 		err := c.CheckTrain(schemapb.DataType_FloatVector, schemapb.DataType_None, test.params)
@@ -190,11 +213,7 @@ func Test_gpuHnswChecker_CheckValidDataType(t *testing.T) {
 		},
 	}
 
-	c, err := GetIndexCheckerMgrInstance().GetChecker("GPU_HNSW")
-	if c == nil || err != nil {
-		log.Error("can not get GPU_HNSW index checker instance, please enable GPU and rerun it")
-		return
-	}
+	c := requireGpuHnswChecker(t)
 	for _, test := range cases {
 		err := c.CheckValidDataType("GPU_HNSW", &schemapb.FieldSchema{DataType: test.dType})
 		if test.errIsNil {
@@ -228,11 +247,7 @@ func Test_gpuHnswChecker_SetDefaultMetricType(t *testing.T) {
 		},
 	}
 
-	c, err := GetIndexCheckerMgrInstance().GetChecker("GPU_HNSW")
-	if c == nil || err != nil {
-		log.Error("can not get GPU_HNSW index checker instance, please enable GPU and rerun it")
-		return
-	}
+	c := requireGpuHnswChecker(t)
 	for _, test := range cases {
 		p := map[string]string{
 			DIM:            strconv.Itoa(128),

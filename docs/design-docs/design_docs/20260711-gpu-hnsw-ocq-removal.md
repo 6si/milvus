@@ -80,3 +80,87 @@ If a future workload is proven to be `ef`-ceiling-bound and short on recall, OCQ
 - No behavioral regression: the search path already ran with an empty (no-op)
   queue, so results are unchanged. Recall is tuned via `ef` as before.
 - PR titles/descriptions and the design doc no longer claim OCQ behavior.
+
+---
+
+# Related Decision: Filtered search (delete / TTL / partition bitset) is unsupported
+
+- **Status:** Accepted (documented limitation; GPU-side filtering is a follow-up)
+
+## Context
+
+Milvus passes a `BitsetView` into `Search()` to mask out rows that must not be
+returned — deleted rows, TTL-expired rows, and partition/visibility filters.
+Sealed segments accumulate these routinely, so on any collection with deletes a
+normal query eventually carries a non-empty bitset.
+
+`GpuHnswIndexNode::Search()` rejects a non-empty bitset with `Status::invalid_args`
+(guarded on `bitset.data() != nullptr`, not `count()`, so a filter cannot slip
+through when the caller omits `num_filtered_out_bits`).
+
+## Options considered
+
+1. **In-node CPU fallback when a bitset is present.** Rejected: the CPU index
+   copy is freed immediately after the GPU upload (to save host RAM and because
+   `HasRawData()` is `false`), so there is no CPU index left in the node to fall
+   back to. Keeping a CPU copy alongside the GPU copy would defeat the memory
+   rationale for GPU_HNSW.
+2. **GPU-side bitset filtering** (mask filtered IDs inside the kernel and
+   over-fetch to backfill `k`). This is the correct long-term fix but is real
+   kernel work and — critically — **cannot be validated without GPU capacity**,
+   which is currently unavailable. Shipping an unverified kernel behavior change
+   would violate the verification gate.
+3. **Silently ignore the bitset / return unfiltered results.** Rejected:
+   returns deleted/expired/out-of-partition rows — a correctness violation.
+4. **Reject + document the limitation, and treat GPU_HNSW as an
+   append-mostly/immutable-collection index.** Chosen for now.
+
+## Decision
+
+Keep the hard reject, document it as an explicit failure mode in
+`20260619-gpu-hnsw.md`, and scope GPU_HNSW/GPU_HNSW_SQ to append-mostly /
+immutable collections until GPU-side bitset filtering (option 2) is implemented
+and benchmarked on real GPU capacity.
+
+## Follow-up
+
+Implement in-kernel bitset filtering with over-fetch (option 2) and add a
+recall/latency benchmark under filtering once GPU capacity returns. Until then,
+the reject prevents silently-wrong results.
+
+---
+
+# Related Decision: GPU_HNSW_SQ is a registered alias of GPU_HNSW
+
+- **Status:** Accepted
+
+## Context
+
+Milvus exposes a `GPU_HNSW_SQ` index type (constant, param spec, GPU
+resource/routing handling, and python test suites), but Knowhere originally
+registered only `GPU_HNSW`. A user creating `GPU_HNSW_SQ` would hit no backend.
+
+## Decision
+
+Register `GPU_HNSW_SQ` in Knowhere as a thin subclass of `GpuHnswIndexNode`
+(`GpuHnswSQIndexNode`) that only overrides `Type()`. The GPU search path is
+identical — both take a CPU-built HNSW/HNSW_SQ index and upload it to
+`GpuIndexHNSW` — so no separate kernel or storage path is needed; the distinct
+`Type()` keeps Milvus's configured `index_type` consistent with the loaded node.
+This is additive and non-destructive (preserves Milvus's existing API/tests)
+rather than dropping the type. If a distinct SQ-specific backend is ever needed,
+the subclass is the extension point.
+
+Registered for `VECTOR_FLOAT` and `VECTOR_INT8` (matching `GPU_HNSW`).
+
+## Go param checker (GPU_HNSW / GPU_HNSW_SQ)
+
+`newGpuHnswChecker()` existed but was never registered, and `GetChecker()`
+short-circuits any vec-index type to the unified `vecIndexChecker` (whose
+knowhere `ValidateIndexParams` is a no-op for GPU_HNSW), so the dedicated
+M/efConstruction range validation never ran. Fixed by registering the checker
+for `GPU_HNSW`/`GPU_HNSW_SQ` and routing those two types to it ahead of the
+unified-checker short-circuit. The checker unit tests, which previously
+silently `return`ed (reported PASS) when `GetChecker` yielded nil, now `t.Skip`
+honestly on non-GPU builds and a pure-Go routing test asserts the correct
+checker type is returned.
