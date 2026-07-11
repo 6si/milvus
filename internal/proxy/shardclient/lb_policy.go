@@ -382,7 +382,7 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 
 	// Single channel fast path: skip errgroup/goroutine overhead
 	if len(channelList) == 1 {
-		err := lb.ExecuteWithRetry(ctx, ChannelWorkload{
+		return lb.ExecuteWithRetry(ctx, ChannelWorkload{
 			Db:              workload.Db,
 			CollectionName:  workload.CollectionName,
 			CollectionID:    workload.CollectionID,
@@ -391,7 +391,6 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			Exec:            workload.Exec,
 			PreferredNodeID: preferredNodeID(workload, channelList[0]),
 		})
-		return err
 	}
 
 	wg, _ := errgroup.WithContext(ctx)
@@ -408,8 +407,7 @@ func (lb *LBPolicyImpl) Execute(ctx context.Context, workload CollectionWorkLoad
 			})
 		})
 	}
-	err = wg.Wait()
-	return err
+	return wg.Wait()
 }
 
 // ExecuteOneChannel will execute at any one channel in collection

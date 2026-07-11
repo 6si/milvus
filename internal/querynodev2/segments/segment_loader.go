@@ -310,6 +310,10 @@ func (loader *segmentLoader) Load(ctx context.Context,
 				indexparams.SetBitmapIndexLoadParams(paramtable.Get(), indexParams)
 			}
 
+			// Re-apply AppendPrepareLoadParams here (it also ran before resource
+			// estimation above). It is idempotent, and this pass must run after
+			// the DiskANN/bitmap load params are set so those are included in
+			// the params handed to segment creation.
 			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
 				return nil, err
 			}
@@ -2523,6 +2527,19 @@ func (loader *segmentLoader) LoadIndex(ctx context.Context,
 	infos := loader.prepare(ctx, commonpb.SegmentState_SegmentStateNone, loadInfo)
 	defer loader.unregister(infos...)
 
+	// Apply override_index_type before resource estimation and index load, so
+	// this hot index-update path routes GPU_HNSW like Load/ReopenSegments even
+	// if a caller ever reaches it without the handler-level override.
+	for _, info := range infos {
+		for _, indexInfo := range info.GetIndexInfos() {
+			indexParams := funcutil.KeyValuePair2Map(indexInfo.IndexParams)
+			if err := indexparams.AppendPrepareLoadParams(paramtable.Get(), indexParams); err != nil {
+				return err
+			}
+			indexInfo.IndexParams = funcutil.Map2KeyValuePair(indexParams)
+		}
+	}
+
 	indexInfo := lo.Map(infos, func(info *querypb.SegmentLoadInfo, _ int) *querypb.SegmentLoadInfo {
 		info = typeutil.Clone(info)
 		// remain binlog paths whose field id is in index infos to estimate resource usage correctly
@@ -2644,7 +2661,10 @@ func gpuIndexRequiresGpu(indexParams []*commonpb.KeyValuePair) bool {
 	case "GPU_CAGRA", "GPU_CUVS_CAGRA":
 	case "GPU_BRUTE_FORCE", "GPU_CUVS_BRUTE_FORCE",
 		"GPU_IVF_FLAT", "GPU_CUVS_IVF_FLAT",
-		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ":
+		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ",
+		// GPU_HNSW / GPU_HNSW_SQ load directly on the GPU with no
+		// adapt_for_cpu step, so they always require GPU resources.
+		"GPU_HNSW", "GPU_HNSW_SQ":
 		return true
 	default:
 		return false
