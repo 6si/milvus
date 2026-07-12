@@ -14,7 +14,10 @@
 # Update KNOWHERE_VERSION for the first occurrence
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-set( KNOWHERE_VERSION gpu-hnsw-faiss )
+# Pinned to an immutable commit SHA on 6si/knowhere@gpu-hnsw-faiss rather than the
+# branch name: a branch is mutable and the build could change with no milvus PR.
+# Repoint to a tagged 6si/knowhere release before merging to production.
+set( KNOWHERE_VERSION 22fd143b360a0b37bc89a2128c496b95abfb3914 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
