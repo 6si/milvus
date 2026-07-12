@@ -2228,8 +2228,22 @@ func estimateLoadingResourceUsageOfSegment(schema *schemapb.CollectionSchema, lo
 					fieldIndexInfo.GetBuildID())
 			}
 
+			// Non-tiered: the caching layer is bypassed, so every index's
+			// transient peak (maxMemoryCost) and disk cost are charged here.
+			// Tiered eviction: the caching layer (MCL) tracks only resident cost,
+			// so these additions are normally skipped. GPU indexes are the
+			// exception — a GPU_HNSW upload materializes the CPU index + fp32
+			// staging in host RAM (~2x file size) and frees it once vectors reach
+			// VRAM, leaving resident host cost ~0. That transient peak is invisible
+			// to MCL, so it must still be charged to the loading estimate;
+			// otherwise concurrent loads are admitted against a ~0-cost estimate
+			// and the accumulated peaks OOM the node. The reservation is released
+			// in freeRequestResource once the load completes.
+			indexMemorySize += indexLoadingMemoryContribution(
+				multiplyFactor.TieredEvictionEnabled,
+				gpuIndexRequiresGpu(fieldIndexInfo.IndexParams),
+				estimateResult.MaxMemoryCost)
 			if !multiplyFactor.TieredEvictionEnabled {
-				indexMemorySize += estimateResult.MaxMemoryCost
 				segDiskLoadingSize += estimateResult.MaxDiskCost
 			}
 
@@ -2658,6 +2672,22 @@ func getBinlogDataMemorySize(fieldBinlog *datapb.FieldBinlog) int64 {
 	}
 
 	return fieldSize
+}
+
+// indexLoadingMemoryContribution returns the transient host memory (bytes) to
+// charge to the segment loading estimate for a single index field.
+//
+// With tiered eviction disabled the caching layer is bypassed, so every index's
+// upload peak (maxMemoryCost) is charged directly. With tiered eviction enabled
+// the caching layer tracks resident cost and this is normally 0 — except for GPU
+// indexes, whose upload peak is transient host RAM freed once vectors reach VRAM
+// and is therefore never seen by the caching layer. Charging it here lets tiered
+// admission reserve the peak and throttle concurrent loads.
+func indexLoadingMemoryContribution(tieredEvictionEnabled, isGpuIndex bool, maxMemoryCost uint64) uint64 {
+	if !tieredEvictionEnabled || isGpuIndex {
+		return maxMemoryCost
+	}
+	return 0
 }
 
 func gpuIndexRequiresGpu(indexParams []*commonpb.KeyValuePair) bool {
