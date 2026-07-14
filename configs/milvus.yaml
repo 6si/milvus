@@ -319,6 +319,7 @@ proxy:
     timeTick:
       bufSize: 512 # The maximum number of messages can be buffered in the timeTick message stream of the proxy when producing messages.
   maxNameLength: 255 # The maximum length of the name or alias that can be created in Milvus, including the collection name, collection alias, partition name, and field name.
+  maxCollectionDescriptionLength: 1024 # The maximum byte length of a collection description accepted by CreateCollection and AlterCollection. Existing collection metadata is not revalidated, but restore or replication flows that recreate a collection through CreateCollection must satisfy this limit or raise it first.
   maxFieldNum: 64 # The maximum number of field can be created when creating in a collection. It is strongly DISCOURAGED to set maxFieldNum >= 64.
   maxVectorFieldNum: 10 # The maximum number of vector fields that can be specified in a collection
   maxShardNum: 16 # The maximum number of shards can be created when creating in a collection.
@@ -327,6 +328,7 @@ proxy:
   # please adjust in embedded Milvus: false
   ginLogging: true
   ginLogSkipPaths: / # skip url path for gin log
+  maxRoleDescriptionLength: 1024 # Maximum role description length in bytes.
   nameValidation:
     allowedChars: $ # Additional characters allowed in names beyond underscores, letters and numbers. To allow hyphens in names, add '-' here.
   roleNameValidation:
@@ -335,6 +337,7 @@ proxy:
   ddlConcurrency: 16 # The concurrent execution number of DDL at proxy.
   dclConcurrency: 16 # The concurrent execution number of DCL at proxy.
   mustUsePartitionKey: false # switch for whether proxy must use partition key for the collection
+  maxArrayCapacity: 4096 # maximum number of elements in an array field for a single row
   # maximum number of result entries, typically Nq * TopK * GroupSize. 
   # It costs additional memory and time to process a large number of result entries. 
   # If the number of result entries exceeds this limit, the search will be rejected.
@@ -352,15 +355,15 @@ proxy:
     remoteMaxTime: 0 # The time interval allowed for uploading access log files. If the upload time of a log file exceeds this interval, the file will be deleted. Setting the value to 0 disables this feature.
     formatters:
       base:
-        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost]"
+        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [error_type: $error_type]"
       query:
-        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [expr: $method_expr] [params: $query_params]"
-        methods: "Query, Delete"
+        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [expr: $method_expr] [params: $query_params] [error_type: $error_type]"
+        methods: "Query, Delete, /query, /v2/vectordb/entities/query, /v2/vectordb/entities/get, /v2/vectordb/entities/delete"
       search:
-        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [expr: $method_expr] [nq: $nq] [params: $search_params]"
-        methods: "HybridSearch, Search"
+        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [expr: $method_expr] [nq: $nq] [params: $search_params] [error_type: $error_type]"
+        methods: "HybridSearch, Search, /search, /v2/vectordb/entities/search, /v2/vectordb/entities/advanced_search, /v2/vectordb/entities/hybrid_search"
       upsert:
-        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [partial_update: $partial_update]"
+        format: "[$time_now] [ACCESS] <$user_name: $user_addr> $method_name [status: $method_status] [code: $error_code] [sdk: $sdk_version] [msg: $error_msg] [traceID: $trace_id] [timeCost: $time_cost] [database: $database_name] [collection: $collection_name] [partitions: $partition_name] [partial_update: $partial_update] [error_type: $error_type]"
         methods: Upsert
     cacheSize: 0 # Size of log of write cache, in byte. (Close write cache if size was 0)
     cacheFlushInterval: 3 # time interval of auto flush write cache, in seconds. (Close auto flush if interval was 0)
@@ -400,7 +403,7 @@ queryCoord:
   autoHandoff: true
   autoBalance: true # Switch value to control if to automatically balance the memory usage among query nodes by distributing segment loading and releasing operations evenly.
   autoBalanceChannel: true # Enable auto balance channel
-  balancer: ScoreBasedBalancer # auto balancer used for segments on queryNodes
+  balancer: ChannelLevelScoreBalancer # auto balancer used for segments on queryNodes
   globalRowCountFactor: 0.1 # the weight used when balancing segments among queryNodes
   scoreUnbalanceTolerationFactor: 0.05 # the least value for unbalanced extent between from and to nodes when doing balance
   reverseUnBalanceTolerationFactor: 1.3 # the largest value for unbalanced extent between from and to nodes after doing balance
@@ -427,6 +430,7 @@ queryCoord:
   channelTaskTimeout: 60000 # 1 minute
   segmentTaskTimeout: 120000 # 2 minute
   distPullInterval: 500
+  dispatchInterval: 500
   heartbeatAvailableInterval: 10000 # 10s, Only QueryNodes which fetched heartbeats within the duration are available
   loadTimeoutSeconds: 600
   distRequestTimeout: 5000 # the request timeout for querycoord fetching data distribution from querynodes, in milliseconds
@@ -444,7 +448,7 @@ queryCoord:
   gracefulStopTimeout: 5 # seconds. force stop node without graceful stop
   enableStoppingBalance: true # whether enable stopping balance
   stoppingBalanceAssignPolicy: ScoreBased # assign policy for stopping balance, options: RoundRobin, RowCount, ScoreBased
-  channelExclusiveNodeFactor: 4 # the least node number for enable channel's exclusive mode
+  channelExclusiveNodeFactor: 3 # minimum RW QueryNode count per channel required to enable channel exclusive mode
   collectionObserverInterval: 200 # the interval of collection observer
   updateCollectionLoadStatusInterval: 5 # 5m, max interval of updating collection loaded status for check health
   channelTaskCapFraction: 0.3 # fraction of total task execution capacity reserved for channel tasks per node (0.0-1.0)
@@ -571,10 +575,12 @@ queryNode:
       enableCrossUserGrouping: false # Enable Cross user grouping when using user-task-polling policy. (Disable it if user's task can not merge each other)
       maxPendingTaskPerUser: 1024 # Max pending task per user in scheduler
   grouping:
-    maxNQ: 16
-    nqMergeRatio: 3 # Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.
+    maxNQ: 64
+    nqMergeRatio: 16 # Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.
     maxDeadlineMergeGap: 50ms # Maximum allowed gap between task context deadlines when grouping query node read tasks. Tasks with only one deadline cannot be grouped. Set a negative duration to disable this check.
     topKMergeRatio: 20
+  search:
+    enableResultZeroCopy: false # When true, delegator passes reduced SearchResultData directly instead of re-marshaling to SlicedBlob. Toggle at runtime for instant fallback.
   levelZeroForwardPolicy: FilterByBF # delegator level zero deletion forward policy, possible option["FilterByBF", "RemoteLoad"]
   streamingDeltaForwardPolicy: FilterByBF # delegator streaming deletion forward policy, possible option["FilterByBF", "Direct"]
   forwardBatchSize: 4194304 # the batch size delegator uses for forwarding stream delete in loading procedure
@@ -586,6 +592,8 @@ queryNode:
     flowGraph:
       maxQueueLength: 16 # The maximum size of task queue cache in flow graph in query node.
       maxParallelism: 1024 # Maximum number of tasks executed in parallel in the flowgraph
+    dmlMicroBatch:
+      maxMsgNum: 8 # Maximum number of DML messages in one micro-batch drained by query node data sync pipeline. The batcher only drains already buffered messages and does not wait for more messages.
   enableSegmentPrune: false # use partition stats to prune data in search/query on shard delegator
   queryStreamBatchSize: 4194304 # return min batch size of stream query
   queryStreamMaxBatchSize: 134217728 # return max batch size of stream query
@@ -938,6 +946,8 @@ common:
   defaultIndexName: _default_idx # Name of the index when it is created with name unspecified
   entityExpiration: -1 # Entity expiration in seconds, CAUTION -1 means never expire
   indexSliceSize: 16 # Index slice size in MB
+  entryStream:
+    streamBudgetRatio: 3 # Multiplier for entry stream transient memory budget, relative to CPU core count
   threadCoreCoefficient:
     highPriority: 10 # This parameter specify how many times the number of threads is the number of cores in high priority pool
     middlePriority: 5 # This parameter specify how many times the number of threads is the number of cores in middle priority pool
@@ -1038,7 +1048,7 @@ common:
   sync:
     taskPoolReleaseTimeoutSeconds: 60 # The maximum time to wait for the task to finish and release resources in the pool
   enabledOptimizeExpr: true # Indicates whether to enable optimize expr
-  enabledJSONShredding: false # Indicates sealedsegment whether to enable JSON key stats
+  enabledJSONShredding: true # Indicates sealedsegment whether to enable JSON key stats
   enabledGrowingSegmentJSONShredding: false # Indicates growingsegment whether to enable JSON key stats
   enableConfigParamTypeCheck: true # Indicates whether to enable config param type check
   enablePosixMode: false # Specifies whether to run in POSIX mode for enhanced file system compatibility
@@ -1438,6 +1448,10 @@ function:
         credential:  # The name in the credential configuration item
         enable: true # Whether to enable Gemini model service
         url:  # Your Gemini embedding url, Default is the official embedding url
+      huggingface:
+        credential:  # The name in the credential configuration item
+        enable: true # Whether to enable Hugging Face text embedding service
+        url:  # Your Hugging Face Inference Providers router URL, default is https://router.huggingface.co
       openai:
         credential:  # The name in the crendential configuration item
         enable: true # Whether to enable openai model service
@@ -1464,6 +1478,10 @@ function:
           credential:  # The name in the crendential configuration item
           enable: true # Whether to enable cohere model service
           url:  # Your cohere rerank url, Default is the official rerank url
+        huggingface:
+          credential:  # The name in the credential configuration item
+          enable: true # Whether to enable Hugging Face rerank service
+          url:  # Your Hugging Face Inference Providers router URL, default is https://router.huggingface.co
         siliconflow:
           credential:  # The name in the crendential configuration item
           enable: true # Whether to enable siliconflow model service
@@ -1480,3 +1498,5 @@ function:
           url:  # Your voyageai rerank url, Default is the official rerank url
   analyzer:
     local_resource_path: /var/lib/milvus/analyzer
+    concurrency_per_cpu_core: 8 # The concurrency per cpu core for analyzer, pipeline not included
+    runner_concurrency: 8 # The concurrency for each function runner to tokenize text

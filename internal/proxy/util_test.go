@@ -41,6 +41,7 @@ import (
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v2/proto/internalpb"
 	"github.com/milvus-io/milvus/pkg/v2/proto/querypb"
@@ -79,6 +80,53 @@ func TestValidateCollectionName(t *testing.T) {
 		assert.NotNil(t, validateCollectionNameOrAlias(name, "name"))
 		assert.NotNil(t, validateCollectionNameOrAlias(name, "alias"))
 	}
+}
+
+func TestValidateCollectionDescription(t *testing.T) {
+	maxLength := Params.ProxyCfg.MaxCollectionDescriptionLength.GetAsInt()
+	tests := []struct {
+		name        string
+		description string
+		wantErr     bool
+	}{
+		{
+			name:        "empty description",
+			description: "",
+		},
+		{
+			name:        "exactly max bytes",
+			description: strings.Repeat("a", maxLength),
+		},
+		{
+			name:        "over max bytes",
+			description: strings.Repeat("a", maxLength+1),
+			wantErr:     true,
+		},
+		{
+			name:        "cjk rune count under max but byte length over max",
+			description: strings.Repeat("中", maxLength/3+1),
+			wantErr:     true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateCollectionDescription(test.description)
+			if test.wantErr {
+				assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+				return
+			}
+			assert.NoError(t, err)
+		})
+	}
+
+	t.Run("uses refreshable paramtable limit", func(t *testing.T) {
+		old := Params.ProxyCfg.MaxCollectionDescriptionLength.SwapTempValue("3")
+		defer Params.ProxyCfg.MaxCollectionDescriptionLength.SwapTempValue(old)
+
+		err := validateCollectionDescription("abcd")
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
 }
 
 func TestValidateResourceGroupName(t *testing.T) {
@@ -264,7 +312,32 @@ func TestValidateDimension(t *testing.T) {
 	}
 	assert.NotNil(t, validateDimension(fieldSchema))
 
+	fieldSchema.DataType = schemapb.DataType_ArrayOfVector
+	fieldSchema.ElementType = schemapb.DataType_BinaryVector
+	fieldSchema.TypeParams = []*commonpb.KeyValuePair{
+		{
+			Key:   common.DimKey,
+			Value: "10",
+		},
+	}
+	assert.NotNil(t, validateDimension(fieldSchema))
+	fieldSchema.TypeParams = []*commonpb.KeyValuePair{
+		{
+			Key:   common.DimKey,
+			Value: "16",
+		},
+	}
+	assert.Nil(t, validateDimension(fieldSchema))
+	fieldSchema.TypeParams = []*commonpb.KeyValuePair{
+		{
+			Key:   common.DimKey,
+			Value: strconv.Itoa(Params.ProxyCfg.MaxDimension.GetAsInt() * 8),
+		},
+	}
+	assert.Nil(t, validateDimension(fieldSchema))
+
 	fieldSchema.DataType = schemapb.DataType_Int8Vector
+	fieldSchema.ElementType = schemapb.DataType_None
 	fieldSchema.TypeParams = []*commonpb.KeyValuePair{
 		{
 			Key:   common.DimKey,
@@ -2320,6 +2393,8 @@ func Test_CheckDynamicFieldData(t *testing.T) {
 }
 
 func Test_validateMaxCapacityPerRow(t *testing.T) {
+	paramtable.Init()
+
 	t.Run("normal case", func(t *testing.T) {
 		arrayField := &schemapb.FieldSchema{
 			DataType:    schemapb.DataType_Array,
@@ -2380,6 +2455,27 @@ func Test_validateMaxCapacityPerRow(t *testing.T) {
 
 		err := validateMaxCapacityPerRow("collection", arrayField)
 		assert.Error(t, err)
+	})
+
+	t.Run("custom max capacity", func(t *testing.T) {
+		paramtable.Init()
+		err := paramtable.Get().Save(paramtable.Get().ProxyCfg.MaxArrayCapacity.Key, "5000")
+		assert.NoError(t, err)
+		defer paramtable.Get().Reset(paramtable.Get().ProxyCfg.MaxArrayCapacity.Key)
+
+		arrayField := &schemapb.FieldSchema{
+			DataType:    schemapb.DataType_Array,
+			ElementType: schemapb.DataType_Int64,
+			TypeParams: []*commonpb.KeyValuePair{
+				{
+					Key:   common.MaxCapacityKey,
+					Value: "5000",
+				},
+			},
+		}
+
+		err = validateMaxCapacityPerRow("collection", arrayField)
+		assert.NoError(t, err)
 	})
 }
 
@@ -3437,12 +3533,14 @@ func BenchmarkCheckVarcharFormat(b *testing.B) {
 
 func TestCheckAndFlattenStructFieldData(t *testing.T) {
 	createTestSchema := func(name string, structFields []*schemapb.StructArrayFieldSchema, normalFields []*schemapb.FieldSchema) *schemapb.CollectionSchema {
-		return &schemapb.CollectionSchema{
+		schema := &schemapb.CollectionSchema{
 			Name:              name,
 			Description:       "test collection with struct array fields",
 			StructArrayFields: structFields,
 			Fields:            normalFields,
 		}
+		assert.NoError(t, transformStructFieldNames(schema))
+		return schema
 	}
 
 	createTestInsertMsg := func(collectionName string, fieldsData []*schemapb.FieldData) *msgstream.InsertMsg {
@@ -3596,8 +3694,13 @@ func TestCheckAndFlattenStructFieldData(t *testing.T) {
 		structField2 := &schemapb.StructArrayFieldSchema{
 			Name: "struct2",
 			Fields: []*schemapb.FieldSchema{
-				{Name: "field2", DataType: schemapb.DataType_Array},
-				{Name: "field3", DataType: schemapb.DataType_ArrayOfVector},
+				{Name: "field2", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int32},
+				{
+					Name:        "field3",
+					DataType:    schemapb.DataType_ArrayOfVector,
+					ElementType: schemapb.DataType_FloatVector,
+					TypeParams:  []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "1"}},
+				},
 			},
 		}
 		schema := createTestSchema("test_collection", []*schemapb.StructArrayFieldSchema{structField1, structField2}, nil)
@@ -3628,6 +3731,100 @@ func TestCheckAndFlattenStructFieldData(t *testing.T) {
 		assert.Contains(t, fieldNames, "struct1[field1]")
 		assert.Contains(t, fieldNames, "struct2[field2]")
 		assert.Contains(t, fieldNames, "struct2[field3]")
+	})
+
+	t.Run("error - vector payload length not divisible by dim", func(t *testing.T) {
+		structField := &schemapb.StructArrayFieldSchema{
+			Name: "test_struct",
+			Fields: []*schemapb.FieldSchema{
+				{Name: "field1", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int32},
+				{
+					Name:        "field2",
+					DataType:    schemapb.DataType_ArrayOfVector,
+					ElementType: schemapb.DataType_FloatVector,
+					TypeParams:  []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "768"}},
+				},
+			},
+		}
+		schema := createTestSchema("test_collection", []*schemapb.StructArrayFieldSchema{structField}, nil)
+
+		field1Data := createScalarArrayFieldData("field1", []*schemapb.ScalarField{
+			{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{1}}}},
+		})
+		field2Data := createVectorArrayFieldData("field2", []*schemapb.VectorField{
+			{Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, 512)}}},
+		})
+
+		structFieldData := createStructArrayFieldData("test_struct", []*schemapb.FieldData{field1Data, field2Data})
+		insertMsg := createTestInsertMsg("test_collection", []*schemapb.FieldData{structFieldData})
+
+		err := checkAndFlattenStructFieldData(schema, insertMsg)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "payload length 512 is not divisible by vector width 768")
+	})
+
+	t.Run("error - inconsistent struct element count with vector array", func(t *testing.T) {
+		structField := &schemapb.StructArrayFieldSchema{
+			Name: "test_struct",
+			Fields: []*schemapb.FieldSchema{
+				{Name: "field1", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int32},
+				{
+					Name:        "field2",
+					DataType:    schemapb.DataType_ArrayOfVector,
+					ElementType: schemapb.DataType_FloatVector,
+					TypeParams:  []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "768"}},
+				},
+			},
+		}
+		schema := createTestSchema("test_collection", []*schemapb.StructArrayFieldSchema{structField}, nil)
+
+		field1Data := createScalarArrayFieldData("field1", []*schemapb.ScalarField{
+			{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{1}}}},
+		})
+		field2Data := createVectorArrayFieldData("field2", []*schemapb.VectorField{
+			{Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, 1536)}}},
+		})
+
+		structFieldData := createStructArrayFieldData("test_struct", []*schemapb.FieldData{field1Data, field2Data})
+		insertMsg := createTestInsertMsg("test_collection", []*schemapb.FieldData{structFieldData})
+
+		err := checkAndFlattenStructFieldData(schema, insertMsg)
+
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "inconsistent struct element count")
+		assert.Contains(t, err.Error(), "'field1' has 1, 'field2' has 2")
+	})
+
+	t.Run("success - matching scalar and vector struct element counts", func(t *testing.T) {
+		structField := &schemapb.StructArrayFieldSchema{
+			Name: "test_struct",
+			Fields: []*schemapb.FieldSchema{
+				{Name: "field1", DataType: schemapb.DataType_Array, ElementType: schemapb.DataType_Int32},
+				{
+					Name:        "field2",
+					DataType:    schemapb.DataType_ArrayOfVector,
+					ElementType: schemapb.DataType_FloatVector,
+					TypeParams:  []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "768"}},
+				},
+			},
+		}
+		schema := createTestSchema("test_collection", []*schemapb.StructArrayFieldSchema{structField}, nil)
+
+		field1Data := createScalarArrayFieldData("field1", []*schemapb.ScalarField{
+			{Data: &schemapb.ScalarField_IntData{IntData: &schemapb.IntArray{Data: []int32{1, 2}}}},
+		})
+		field2Data := createVectorArrayFieldData("field2", []*schemapb.VectorField{
+			{Data: &schemapb.VectorField_FloatVector{FloatVector: &schemapb.FloatArray{Data: make([]float32, 1536)}}},
+		})
+
+		structFieldData := createStructArrayFieldData("test_struct", []*schemapb.FieldData{field1Data, field2Data})
+		insertMsg := createTestInsertMsg("test_collection", []*schemapb.FieldData{structFieldData})
+
+		err := checkAndFlattenStructFieldData(schema, insertMsg)
+
+		assert.NoError(t, err)
+		assert.Len(t, insertMsg.FieldsData, 2)
 	})
 
 	t.Run("success - mixed normal and struct fields", func(t *testing.T) {
@@ -3937,6 +4134,33 @@ func TestValidateFieldsInStruct(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("valid binary array of vector field", func(t *testing.T) {
+		field := &schemapb.FieldSchema{
+			Name:        "valid_binary_array_vector",
+			DataType:    schemapb.DataType_ArrayOfVector,
+			ElementType: schemapb.DataType_BinaryVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: strconv.Itoa(Params.ProxyCfg.MaxDimension.GetAsInt() * 8)},
+			},
+		}
+		err := ValidateFieldsInStruct(field, schema)
+		assert.NoError(t, err)
+	})
+
+	t.Run("binary array of vector dimension must be multiple of 8", func(t *testing.T) {
+		field := &schemapb.FieldSchema{
+			Name:        "invalid_binary_array_vector",
+			DataType:    schemapb.DataType_ArrayOfVector,
+			ElementType: schemapb.DataType_BinaryVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "10"},
+			},
+		}
+		err := ValidateFieldsInStruct(field, schema)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "binary vector dimension should be multiple of 8")
+	})
+
 	t.Run("invalid field name", func(t *testing.T) {
 		testCases := []struct {
 			name     string
@@ -4020,7 +4244,7 @@ func TestValidateFieldsInStruct(t *testing.T) {
 		}
 		err := ValidateFieldsInStruct(field, schema)
 		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "unsupported element type of array field array_vector_with_scalar, now only float vector is supported")
+		assert.Contains(t, err.Error(), "only fixed dimension vector types are supported")
 	})
 
 	t.Run("array of vector missing dimension", func(t *testing.T) {
@@ -4100,19 +4324,19 @@ func TestValidateFieldsInStruct(t *testing.T) {
 		assert.Contains(t, err.Error(), "nullable is not supported for fields in struct array now")
 	})
 
-	// t.Run("sparse float vector in array of vector", func(t *testing.T) {
-	// 	// Note: ArrayOfVector with sparse vector element type still requires dimension
-	// 	// because validateDimension checks the field's DataType (ArrayOfVector), not ElementType
-	// 	field := &schemapb.FieldSchema{
-	// 		Name:        "sparse_vector_array",
-	// 		DataType:    schemapb.DataType_ArrayOfVector,
-	// 		ElementType: schemapb.DataType_SparseFloatVector,
-	// 		TypeParams:  []*commonpb.KeyValuePair{},
-	// 	}
-	// 	err := ValidateFieldsInStruct(field, schema)
-	// 	assert.Error(t, err)
-	// 	assert.Contains(t, err.Error(), "dimension is not defined")
-	// })
+	t.Run("sparse float vector in array of vector", func(t *testing.T) {
+		field := &schemapb.FieldSchema{
+			Name:        "sparse_vector_array",
+			DataType:    schemapb.DataType_ArrayOfVector,
+			ElementType: schemapb.DataType_SparseFloatVector,
+			TypeParams: []*commonpb.KeyValuePair{
+				{Key: common.DimKey, Value: "128"},
+			},
+		}
+		err := ValidateFieldsInStruct(field, schema)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "only fixed dimension vector types are supported")
+	})
 
 	t.Run("array with various scalar element types", func(t *testing.T) {
 		validScalarTypes := []schemapb.DataType{
@@ -4139,11 +4363,10 @@ func TestValidateFieldsInStruct(t *testing.T) {
 	t.Run("array of vector with various vector types", func(t *testing.T) {
 		validVectorTypes := []schemapb.DataType{
 			schemapb.DataType_FloatVector,
-			// schemapb.DataType_BinaryVector,
-			// schemapb.DataType_Float16Vector,
-			// schemapb.DataType_BFloat16Vector,
-			// Note: SparseFloatVector is excluded because validateDimension checks
-			// the field's DataType (ArrayOfVector), not ElementType, so it still requires dimension
+			schemapb.DataType_BinaryVector,
+			schemapb.DataType_Float16Vector,
+			schemapb.DataType_BFloat16Vector,
+			schemapb.DataType_Int8Vector,
 		}
 
 		for _, vt := range validVectorTypes {
@@ -5055,4 +5278,17 @@ func TestCheckDuplicatePkExist_MissingPrimaryKey(t *testing.T) {
 	hasDup, err := CheckDuplicatePkExist(primaryFieldSchema, fieldsData)
 	assert.Error(t, err)
 	assert.False(t, hasDup)
+}
+
+func TestFailMetricLabel(t *testing.T) {
+	// untyped / nil errors must take the conservative system bucket
+	assert.Equal(t, metrics.FailSystemLabel, failMetricLabel(nil))
+	assert.Equal(t, metrics.FailSystemLabel, failMetricLabel(errors.New("plain error")))
+	assert.Equal(t, metrics.FailSystemLabel, failMetricLabel(merr.WrapErrServiceInternalMsg("internal failure")))
+	// input-classified merr errors go to the user bucket, also through wrapping
+	assert.Equal(t, metrics.FailInputLabel, failMetricLabel(merr.WrapErrParameterInvalidMsg("bad parameter")))
+	assert.Equal(t, metrics.FailInputLabel, failMetricLabel(merr.Wrap(merr.WrapErrParameterInvalidMsg("bad parameter"), "context")))
+	// client cancellation is neither party's failure
+	assert.Equal(t, metrics.CancelLabel, failMetricLabel(context.Canceled))
+	assert.Equal(t, metrics.CancelLabel, failMetricLabel(errors.Wrap(context.Canceled, "rpc aborted")))
 }

@@ -485,14 +485,16 @@ type TimestampGetter interface {
 	GetTimestamp() uint64
 }
 type PasswordReq struct {
-	UserName string `json:"userName" binding:"required"`
-	Password string `json:"password" binding:"required"`
+	UserName    string  `json:"userName" binding:"required"`
+	Password    string  `json:"password" binding:"required"`
+	Description *string `json:"description"`
 }
 
 type NewPasswordReq struct {
-	UserName    string `json:"userName" binding:"required"`
-	Password    string `json:"password" binding:"required"`
-	NewPassword string `json:"newPassword" binding:"required"`
+	UserName    string  `json:"userName" binding:"required"`
+	Password    string  `json:"password"`
+	NewPassword string  `json:"newPassword"`
+	Description *string `json:"description"`
 }
 
 type UserRoleReq struct {
@@ -501,14 +503,19 @@ type UserRoleReq struct {
 }
 
 type RoleReq struct {
-	DbName   string `json:"dbName"`
-	RoleName string `json:"roleName" binding:"required"`
+	DbName      string `json:"dbName"`
+	RoleName    string `json:"roleName" binding:"required"`
+	Description string `json:"description"`
 }
 
 func (req *RoleReq) GetDbName() string { return req.DbName }
 
 func (req *RoleReq) GetRoleName() string {
 	return req.RoleName
+}
+
+func (req *RoleReq) GetDescription() string {
+	return req.Description
 }
 
 type PrivilegeGroupReq struct {

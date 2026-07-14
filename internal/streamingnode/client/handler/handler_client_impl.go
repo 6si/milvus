@@ -78,7 +78,7 @@ func (hc *handlerClientImpl) GetReplicateCheckpoint(ctx context.Context, pchanne
 	logger := log.With(zap.String("pchannel", pchannel), zap.String("handler", "replicate checkpoint"))
 	cp, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, pchannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
 		if assign.Channel.AccessMode != types.AccessModeRW {
-			return nil, errors.New("replicate checkpoint can only be read for RW channel")
+			return nil, status.NewInner("replicate checkpoint can only be read for RW channel")
 		}
 		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
 		if err == nil {
@@ -115,7 +115,7 @@ func (hc *handlerClientImpl) GetSalvageCheckpoint(ctx context.Context, pchannel 
 	logger := log.With(zap.String("pchannel", pchannel), zap.String("handler", "salvage checkpoint"))
 	cps, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, pchannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
 		if assign.Channel.AccessMode != types.AccessModeRW {
-			return nil, errors.New("salvage checkpoint can only be read for RW channel")
+			return nil, status.NewInner("salvage checkpoint can only be read for RW channel")
 		}
 		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
 		if err == nil {
@@ -170,7 +170,7 @@ func (hc *handlerClientImpl) CreateProducer(ctx context.Context, opts *ProducerO
 	logger := log.With(zap.String("pchannel", opts.PChannel), zap.String("handler", "producer"))
 	p, err := hc.createHandlerAfterStreamingNodeReady(ctx, logger, opts.PChannel, func(ctx context.Context, assign *types.PChannelInfoAssigned) (any, error) {
 		if assign.Channel.AccessMode != types.AccessModeRW {
-			return nil, errors.New("producer can only be created for RW channel")
+			return nil, status.NewInner("producer can only be created for RW channel")
 		}
 		// Check if the localWAL is assigned at local
 		localWAL, err := registry.GetLocalAvailableWAL(assign.Channel)
@@ -291,6 +291,15 @@ func (hc *handlerClientImpl) createHandlerAfterStreamingNodeReady(ctx context.Co
 				return createResult, nil
 			}
 			logger.Warn("create handler failed", zap.Any("assignment", assign), zap.Error(err))
+
+			// Unrecoverable errors (e.g. replicate violation when the WAL is no longer
+			// a secondary cluster) won't change by retrying the same WAL role. Surface
+			// them immediately so callers get a typed error within RTT instead of
+			// retrying until their context deadline.
+			if status.AsStreamingError(err).IsUnrecoverable() {
+				logger.Warn("create handler failed with unrecoverable error, stop retrying", zap.Error(err))
+				return nil, err
+			}
 
 			// Check if the error is permanent failure until new assignment.
 			if isPermanentFailureUntilNewAssignment(err) {

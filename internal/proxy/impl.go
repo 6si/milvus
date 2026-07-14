@@ -51,6 +51,7 @@ import (
 	"github.com/milvus-io/milvus/internal/types"
 	"github.com/milvus-io/milvus/internal/util/hookutil"
 	"github.com/milvus-io/milvus/internal/util/segcore"
+	"github.com/milvus-io/milvus/internal/util/streamingutil/status"
 	"github.com/milvus-io/milvus/pkg/v2/common"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
@@ -907,7 +908,7 @@ func (node *Proxy) BatchDescribeCollection(ctx context.Context, request *milvusp
 	collectionNames := request.GetCollectionName()
 	if len(collectionNames) == 0 {
 		return &milvuspb.BatchDescribeCollectionResponse{
-			Status: merr.Status(merr.WrapErrParameterInvalidMsg("collection names cannot be empty")),
+			Status: merr.Status(merr.WrapErrParameterMissingMsg("collection names cannot be empty")),
 		}, nil
 	}
 
@@ -2600,7 +2601,7 @@ func (node *Proxy) Insert(ctx context.Context, request *milvuspb.InsertRequest) 
 
 	if err := node.sched.dmQueue.Enqueue(it); err != nil {
 		log.Warn("Failed to enqueue insert task: " + err.Error())
-		return constructFailedResponse(merr.WrapErrAsInputErrorWhen(err, merr.ErrCollectionNotFound, merr.ErrDatabaseNotFound)), nil
+		return constructFailedResponse(err), nil
 	}
 
 	log.Debug("Detail of insert request in Proxy")
@@ -3527,7 +3528,9 @@ func (node *Proxy) handleIfSearchByPK(ctx context.Context, request *milvuspb.Sea
 
 	annField := typeutil.GetFieldByName(collectionInfo.schema.CollectionSchema, annsFieldName)
 	if annField == nil {
-		return nil, merr.WrapErrFieldNotFound(annsFieldName, "vector field not found in schema")
+		// annsFieldName comes from the user's search request; a missing field is
+		// the user's input error.
+		return nil, merr.WrapErrAsInputError(merr.WrapErrFieldNotFound(annsFieldName, "vector field not found in schema"))
 	}
 
 	if annField.GetDataType() == schemapb.DataType_ArrayOfVector {
@@ -3548,7 +3551,7 @@ func (node *Proxy) handleIfSearchByPK(ctx context.Context, request *milvuspb.Sea
 	} else {
 		// Vector search: validate and fetch the vector field
 		if !typeutil.IsVectorType(annField.GetDataType()) {
-			return nil, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("field (%s) to search is not of vector data type", annsFieldName))
+			return nil, merr.WrapErrParameterInvalidMsg("field (%s) to search is not of vector data type", annsFieldName)
 		}
 		fieldToFetch = annsFieldName
 	}
@@ -5218,11 +5221,14 @@ func (node *Proxy) CreateCredential(ctx context.Context, req *milvuspb.CreateCre
 	if err := ValidateUsername(username); err != nil {
 		return merr.Status(err), nil
 	}
+	if err := ValidateUserDescription(req.GetDescription()); err != nil {
+		return merr.Status(err), nil
+	}
 	rawPassword, err := crypto.Base64Decode(req.Password)
 	if err != nil {
 		log.Error("decode password fail",
 			zap.Error(err))
-		err = errors.Wrap(err, "decode password fail")
+		err = merr.WrapErrParameterInvalidErr(err, "decode password fail")
 		return merr.Status(err), nil
 	}
 	if err = ValidatePassword(rawPassword); err != nil {
@@ -5234,7 +5240,7 @@ func (node *Proxy) CreateCredential(ctx context.Context, req *milvuspb.CreateCre
 	if err != nil {
 		log.Error("encrypt password fail",
 			zap.Error(err))
-		err = errors.Wrap(err, "encrypt password failed")
+		err = merr.WrapErrServiceInternalErr(err, "encrypt password failed")
 		return merr.Status(err), nil
 	}
 	if req.Base == nil {
@@ -5246,6 +5252,7 @@ func (node *Proxy) CreateCredential(ctx context.Context, req *milvuspb.CreateCre
 		Username:          req.Username,
 		EncryptedPassword: encryptedPassword,
 		Sha256Password:    crypto.SHA256(rawPassword, req.Username),
+		Description:       req.Description,
 	}
 	result, err := node.mixCoord.CreateCredential(ctx, credInfo)
 	if err != nil { // for error like conntext timeout etc.
@@ -5268,57 +5275,69 @@ func (node *Proxy) UpdateCredential(ctx context.Context, req *milvuspb.UpdateCre
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
 		return merr.Status(err), nil
 	}
-	rawOldPassword, err := crypto.Base64Decode(req.OldPassword)
-	if err != nil {
-		log.Error("decode old password fail",
-			zap.Error(err))
-		err = errors.Wrap(err, "decode old password failed")
+	if err := ValidateUserDescription(req.GetDescription()); err != nil {
 		return merr.Status(err), nil
 	}
-	rawNewPassword, err := crypto.Base64Decode(req.NewPassword)
-	if err != nil {
-		log.Error("decode password fail",
-			zap.Error(err))
-		err = errors.Wrap(err, "decode password failed")
-		return merr.Status(err), nil
-	}
-	// valid new password
-	if err = ValidatePassword(rawNewPassword); err != nil {
-		log.Error("illegal password",
-			zap.Error(err))
+	if req.GetNewPassword() == "" && req.Description == nil {
+		err := merr.WrapErrParameterInvalidMsg("must update either password or description")
 		return merr.Status(err), nil
 	}
 
-	skipPasswordVerify := false
-	if currentUser, _ := GetCurUserFromContext(ctx); currentUser != "" {
-		for _, s := range Params.CommonCfg.SuperUsers.GetAsStrings() {
-			if s == currentUser {
-				skipPasswordVerify = true
+	updateCredReq := &internalpb.CredentialInfo{
+		Username:    req.Username,
+		Description: req.Description,
+	}
+
+	if req.GetNewPassword() != "" {
+		rawOldPassword, err := crypto.Base64Decode(req.OldPassword)
+		if err != nil {
+			log.Error("decode old password fail",
+				zap.Error(err))
+			err = merr.WrapErrParameterInvalidErr(err, "decode old password failed")
+			return merr.Status(err), nil
+		}
+		rawNewPassword, err := crypto.Base64Decode(req.NewPassword)
+		if err != nil {
+			log.Error("decode password fail",
+				zap.Error(err))
+			err = merr.WrapErrParameterInvalidErr(err, "decode password failed")
+			return merr.Status(err), nil
+		}
+		// valid new password
+		if err = ValidatePassword(rawNewPassword); err != nil {
+			log.Error("illegal password",
+				zap.Error(err))
+			return merr.Status(err), nil
+		}
+
+		skipPasswordVerify := false
+		if currentUser, _ := GetCurUserFromContext(ctx); currentUser != "" {
+			for _, s := range Params.CommonCfg.SuperUsers.GetAsStrings() {
+				if s == currentUser {
+					skipPasswordVerify = true
+				}
 			}
 		}
-	}
 
-	if !skipPasswordVerify && !passwordVerify(ctx, req.Username, rawOldPassword, privilege.GetPrivilegeCache()) {
-		err := merr.WrapErrPrivilegeNotAuthenticated("old password not correct for %s", req.GetUsername())
-		return merr.Status(err), nil
-	}
-	// update meta data
-	encryptedPassword, err := crypto.PasswordEncrypt(rawNewPassword)
-	if err != nil {
-		log.Error("encrypt password fail",
-			zap.Error(err))
-		err = errors.Wrap(err, "encrypt password failed")
-		return merr.Status(err), nil
+		if !skipPasswordVerify && !passwordVerify(ctx, req.Username, rawOldPassword, privilege.GetPrivilegeCache()) {
+			err := merr.WrapErrPrivilegeNotAuthenticated("old password not correct for %s", req.GetUsername())
+			return merr.Status(err), nil
+		}
+		// update meta data
+		encryptedPassword, err := crypto.PasswordEncrypt(rawNewPassword)
+		if err != nil {
+			log.Error("encrypt password fail",
+				zap.Error(err))
+			err = merr.WrapErrServiceInternalErr(err, "encrypt password failed")
+			return merr.Status(err), nil
+		}
+		updateCredReq.Sha256Password = crypto.SHA256(rawNewPassword, req.Username)
+		updateCredReq.EncryptedPassword = encryptedPassword
 	}
 	if req.Base == nil {
 		req.Base = &commonpb.MsgBase{}
 	}
 	req.Base.MsgType = commonpb.MsgType_UpdateCredential
-	updateCredReq := &internalpb.CredentialInfo{
-		Username:          req.Username,
-		Sha256Password:    crypto.SHA256(rawNewPassword, req.Username),
-		EncryptedPassword: encryptedPassword,
-	}
 	result, err := node.mixCoord.UpdateCredential(ctx, updateCredReq)
 	if err != nil { // for error like conntext timeout etc.
 		log.Error("update credential fail",
@@ -5402,10 +5421,15 @@ func (node *Proxy) CreateRole(ctx context.Context, req *milvuspb.CreateRoleReque
 	}
 
 	var roleName string
+	var description string
 	if req.Entity != nil {
 		roleName = req.Entity.Name
+		description = req.Entity.GetDescription()
 	}
 	if err := ValidateRoleName(roleName); err != nil {
+		return merr.Status(err), nil
+	}
+	if err := ValidateRoleDescription(description); err != nil {
 		return merr.Status(err), nil
 	}
 	if req.Base == nil {
@@ -5416,6 +5440,39 @@ func (node *Proxy) CreateRole(ctx context.Context, req *milvuspb.CreateRoleReque
 	result, err := node.mixCoord.CreateRole(ctx, req)
 	if err != nil {
 		log.Warn("fail to create role", zap.Error(err))
+		return merr.Status(err), nil
+	}
+	return result, nil
+}
+
+func (node *Proxy) AlterRole(ctx context.Context, req *milvuspb.AlterRoleRequest) (*commonpb.Status, error) {
+	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-AlterRole")
+	defer sp.End()
+
+	log := log.Ctx(ctx)
+
+	log.Info("AlterRole", zap.Stringer("req", req))
+	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
+		return merr.Status(err), nil
+	}
+	if err := ValidateRoleName(req.GetRoleName()); err != nil {
+		return merr.Status(err), nil
+	}
+	if err := ValidateRoleDescription(req.GetDescription()); err != nil {
+		return merr.Status(err), nil
+	}
+	if IsDefaultRole(req.GetRoleName()) {
+		err := merr.WrapErrPrivilegeNotPermitted("the role[%s] is a default role, which can't be altered", req.GetRoleName())
+		return merr.Status(err), nil
+	}
+	if req.Base == nil {
+		req.Base = &commonpb.MsgBase{}
+	}
+	req.Base.MsgType = commonpb.MsgType_AlterRole
+
+	result, err := node.mixCoord.AlterRole(ctx, req)
+	if err != nil {
+		log.Warn("fail to alter role", zap.Error(err))
 		return merr.Status(err), nil
 	}
 	return result, nil
@@ -5551,19 +5608,19 @@ func (node *Proxy) SelectUser(ctx context.Context, req *milvuspb.SelectUserReque
 
 func (node *Proxy) validPrivilegeParams(req *milvuspb.OperatePrivilegeRequest) error {
 	if req.Entity == nil {
-		return errors.New("the entity in the request is nil")
+		return merr.WrapErrParameterInvalidMsg("the entity in the request is nil")
 	}
 	if req.Entity.Grantor == nil {
-		return errors.New("the grantor entity in the grant entity is nil")
+		return merr.WrapErrParameterInvalidMsg("the grantor entity in the grant entity is nil")
 	}
 	if req.Entity.Grantor.Privilege == nil {
-		return errors.New("the privilege entity in the grantor entity is nil")
+		return merr.WrapErrParameterInvalidMsg("the privilege entity in the grantor entity is nil")
 	}
 	if err := ValidatePrivilege(req.Entity.Grantor.Privilege.Name); err != nil {
 		return err
 	}
 	if req.Entity.Object == nil {
-		return errors.New("the resource entity in the grant entity is nil")
+		return merr.WrapErrParameterInvalidMsg("the resource entity in the grant entity is nil")
 	}
 	if err := ValidateObjectType(req.Entity.Object.Name); err != nil {
 		return err
@@ -5572,7 +5629,7 @@ func (node *Proxy) validPrivilegeParams(req *milvuspb.OperatePrivilegeRequest) e
 		return err
 	}
 	if req.Entity.Role == nil {
-		return errors.New("the object entity in the grant entity is nil")
+		return merr.WrapErrParameterInvalidMsg("the object entity in the grant entity is nil")
 	}
 	if err := ValidateRoleName(req.Entity.Role.Name); err != nil {
 		return err
@@ -5843,8 +5900,14 @@ func (node *Proxy) RestoreRBAC(ctx context.Context, req *milvuspb.RestoreRBACMet
 	if err := merr.CheckHealthy(node.GetStateCode()); err != nil {
 		return merr.Status(err), nil
 	}
-	if req.RBACMeta == nil {
+	meta := req.GetRBACMeta()
+	if meta == nil {
 		return merr.Success(), nil
+	}
+	for _, role := range meta.GetRoles() {
+		if err := ValidateRoleDescription(role.GetDescription()); err != nil {
+			return merr.Status(err), nil
+		}
 	}
 
 	result, err := node.mixCoord.RestoreRBAC(ctx, req)
@@ -6435,8 +6498,11 @@ func (node *Proxy) Connect(ctx context.Context, request *milvuspb.ConnectRequest
 
 	if !funcutil.SliceContain(resp.GetDbNames(), db) {
 		log.Info("connect failed, target database not exist")
+		// db is the caller-supplied database name; this Connect handshake builds
+		// the not-found directly (it does not go through GetDatabaseInfo's marking
+		// chokepoint), so stamp InputError here.
 		return &milvuspb.ConnectResponse{
-			Status: merr.Status(merr.WrapErrDatabaseNotFound(db)),
+			Status: merr.Status(merr.WrapErrAsInputError(merr.WrapErrDatabaseNotFound(db))),
 		}, nil
 	}
 
@@ -7082,9 +7148,19 @@ func (node *Proxy) GetReplicateInfo(ctx context.Context, req *milvuspb.GetReplic
 		}
 	}()
 
+	var checkpointProto *commonpb.ReplicateCheckpoint
 	checkpoint, err := streaming.WAL().Replicate().GetReplicateCheckpoint(ctx, req.GetTargetPchannel())
 	if err != nil {
-		return nil, err
+		// On a standalone-primary cluster (e.g. after force_promote) the WAL is no
+		// longer a secondary, so the live replicate checkpoint is unavailable. That
+		// must not hide the salvage checkpoint, which is exactly what callers need
+		// after a force_promote. Other errors are still fatal.
+		if !status.AsStreamingError(err).IsReplicateViolation() {
+			return nil, err
+		}
+		logger.Info("not a secondary cluster, live replicate checkpoint unavailable; continue to salvage checkpoint")
+	} else {
+		checkpointProto = checkpoint.IntoProto()
 	}
 
 	// Get the salvage checkpoint for the specified source cluster.
@@ -7102,7 +7178,7 @@ func (node *Proxy) GetReplicateInfo(ctx context.Context, req *milvuspb.GetReplic
 	}
 
 	return &milvuspb.GetReplicateInfoResponse{
-		Checkpoint:        checkpoint.IntoProto(),
+		Checkpoint:        checkpointProto,
 		SalvageCheckpoint: salvageCheckpointProto,
 	}, nil
 }
@@ -7147,7 +7223,119 @@ func shouldDumpMessage(msgType message.MessageType) bool {
 	return true
 }
 
+// sendDumpMessage sends one immutable WAL message as a DumpMessages response.
+func sendDumpMessage(stream milvuspb.MilvusService_DumpMessagesServer, msg message.ImmutableMessage) error {
+	return stream.Send(&milvuspb.DumpMessagesResponse{
+		Response: &milvuspb.DumpMessagesResponse_Message{
+			Message: msg.IntoImmutableMessageProto(),
+		},
+	})
+}
+
+// dumpTxnMessage expands a scanner-assembled transaction into separate
+// begin/data/commit DumpMessages responses.
+func dumpTxnMessage(
+	stream milvuspb.MilvusService_DumpMessagesServer,
+	txnMsg message.ImmutableTxnMessage,
+	logger *log.MLogger,
+) (int, error) {
+	msgCount := 0
+	begin := txnMsg.Begin()
+	if shouldDumpMessage(begin.MessageType()) {
+		if err := sendDumpMessage(stream, begin); err != nil {
+			logger.Warn("DumpMessages send txn begin failed", zap.Error(err))
+			return msgCount, err
+		}
+		msgCount++
+	}
+
+	if err := txnMsg.RangeOver(func(im message.ImmutableMessage) error {
+		if !shouldDumpMessage(im.MessageType()) {
+			return nil
+		}
+		if err := sendDumpMessage(stream, im); err != nil {
+			logger.Warn("DumpMessages send txn body failed", zap.Error(err))
+			return err
+		}
+		msgCount++
+		return nil
+	}); err != nil {
+		return msgCount, err
+	}
+
+	commit := txnMsg.Commit()
+	if shouldDumpMessage(commit.MessageType()) {
+		if err := sendDumpMessage(stream, commit); err != nil {
+			logger.Warn("DumpMessages send txn commit failed", zap.Error(err))
+			return msgCount, err
+		}
+		msgCount++
+	}
+	return msgCount, nil
+}
+
+// dumpOneMessage writes one scanner output message to the response stream.
+// A transaction scanner output may produce multiple DumpMessages responses.
+func dumpOneMessage(
+	stream milvuspb.MilvusService_DumpMessagesServer,
+	msg message.ImmutableMessage,
+	logger *log.MLogger,
+) (int, error) {
+	if txnMsg, ok := msg.(message.ImmutableTxnMessage); ok {
+		return dumpTxnMessage(stream, txnMsg, logger)
+	}
+
+	if !shouldDumpMessage(msg.MessageType()) {
+		return 0, nil
+	}
+
+	if err := sendDumpMessage(stream, msg); err != nil {
+		logger.Warn("DumpMessages send failed", zap.Error(err))
+		return 0, err
+	}
+	return 1, nil
+}
+
 // DumpMessages streams messages from a WAL range for data salvage.
+// It returns dump-visible messages only; self-controlled internal messages and
+// rollback transaction messages are filtered. A transaction message is returned
+// as separate begin/data/commit responses when the scanner can assemble it.
+// The expanded transaction body order follows the scanner output; it is not a
+// complete replay recipe for write SDKs. Consumers that restore through write
+// APIs should apply delete messages before insert messages in a transaction,
+// especially for the same primary key. Blindly replaying expanded transaction
+// messages in scanner order can change upsert semantics.
+// A transaction is treated as one atomic dump unit for timetick filtering. The
+// start/end timetick window is evaluated before transaction expansion, using
+// the assembled transaction's commit timetick. If the commit timetick is in the
+// window, the whole transaction is dumped; otherwise the whole transaction is
+// skipped. DumpMessages never splits a transaction by filtering individual body
+// messages by their original timeticks.
+// Strict consumers should buffer expanded transaction messages until CommitTxn.
+// If the stream returns a non-EOF error before a transaction is complete, the
+// incomplete transaction prefix must be discarded and replayed from checkpoint.
+//
+// DumpMessagesRequest.start_message_id is a raw WAL start MessageID. For
+// resumable consumption, callers should normally use a LastConfirmedMessageID
+// carried by a previously dumped message, rather than an arbitrary message ID.
+// DumpMessages cannot prove start-message existence after the scanner has
+// applied transaction assembly and filtering. If the requested start point is no
+// longer retained by the underlying WAL, the stream may begin at the earliest
+// currently readable message instead of failing at this layer.
+//
+// IncludeStartMessage makes the underlying WAL read inclusive. The requested
+// start message is not guaranteed to appear in DumpMessages responses:
+// self-controlled internal messages and rollback transaction messages are still
+// filtered, and the scanner may aggregate or ignore transaction messages. If the
+// requested start point is inside a transaction rather than before its begin
+// message, messages from that transaction may not be returned.
+//
+// Strict resume consumers should store the dumped message's MessageID and
+// LastConfirmedMessageID, call DumpMessages with LastConfirmedMessageID and
+// IncludeStartMessage=true, then skip locally until the stored MessageID is
+// seen. Best-effort dump consumers may pass an approximate start MessageID, but
+// gaps or duplicates are possible if that point is filtered, inside a
+// transaction, or no longer retained by the underlying WAL.
 func (node *Proxy) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvuspb.MilvusService_DumpMessagesServer) error {
 	ctx := stream.Context()
 	ctx, sp := otel.Tracer(typeutil.ProxyRole).Start(ctx, "Proxy-DumpMessages")
@@ -7171,12 +7359,24 @@ func (node *Proxy) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvus
 	if req.GetStartMessageId() == nil || len(req.GetStartMessageId().GetId()) == 0 {
 		return merr.WrapErrParameterMissing("start_message_id")
 	}
+	startTimetick := req.GetStartTimetick()
+	endTimetick := req.GetEndTimetick()
+	if startTimetick > 0 && endTimetick > 0 && endTimetick < startTimetick {
+		return merr.WrapErrParameterInvalidMsg("end_timetick must be greater than or equal to start_timetick")
+	}
 
-	startMsgID := message.MustUnmarshalMessageID(req.GetStartMessageId())
+	// Unmarshal the message id without panicking: the id bytes are
+	// client-controlled, so a malformed value must be rejected as an invalid
+	// parameter rather than crashing the process.
+	startMsgID, err := message.UnmarshalMessageID(req.GetStartMessageId())
+	if err != nil {
+		return merr.WrapErrParameterInvalidMsg("invalid start_message_id: %s", err.Error())
+	}
 
-	// Use exclusive start position (dump messages AFTER start_message_id)
-	// This is appropriate for salvage scenarios where start_message_id is the last synced message
 	deliverPolicy := options.DeliverPolicyStartAfter(startMsgID)
+	if req.GetIncludeStartMessage() {
+		deliverPolicy = options.DeliverPolicyStartFrom(startMsgID)
+	}
 
 	// Create a channel-based message handler
 	msgCh := make(adaptor.ChanMessageHandler, 16)
@@ -7188,10 +7388,6 @@ func (node *Proxy) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvus
 		MessageHandler: msgCh,
 	})
 	defer scanner.Close()
-
-	// Get timetick filters
-	startTimetick := req.GetStartTimetick()
-	endTimetick := req.GetEndTimetick()
 
 	msgCount := 0
 	// Stream messages
@@ -7211,38 +7407,35 @@ func (node *Proxy) DumpMessages(req *milvuspb.DumpMessagesRequest, stream milvus
 		case msg, ok := <-msgCh:
 			if !ok {
 				// Channel closed
+				if err := scanner.Error(); err != nil {
+					logger.Warn("DumpMessages scanner error", zap.Error(err), zap.Int("messageCount", msgCount))
+					return err
+				}
 				logger.Info("DumpMessages channel closed", zap.Int("messageCount", msgCount))
 				return nil
 			}
 
 			msgTimetick := msg.TimeTick()
 
-			// Check start timetick filter
-			if startTimetick > 0 && msgTimetick < startTimetick {
-				continue
-			}
-
+			// A transaction is filtered as one atomic unit here: TimeTick is the
+			// commit timetick for assembled transactions, and expansion happens
+			// only after the whole transaction passes the window.
 			// Check end timetick condition
 			if endTimetick > 0 && msgTimetick > endTimetick {
 				logger.Info("DumpMessages reached end timetick", zap.Int("messageCount", msgCount))
 				return nil
 			}
 
-			// Filter system messages
-			if !shouldDumpMessage(msg.MessageType()) {
+			// Check start timetick filter
+			if startTimetick > 0 && msgTimetick < startTimetick {
 				continue
 			}
 
-			// Send message to stream (using oneof - only message, no status)
-			if err := stream.Send(&milvuspb.DumpMessagesResponse{
-				Response: &milvuspb.DumpMessagesResponse_Message{
-					Message: msg.IntoImmutableMessageProto(),
-				},
-			}); err != nil {
-				logger.Warn("DumpMessages send failed", zap.Error(err))
+			dumpedCount, err := dumpOneMessage(stream, msg, logger)
+			if err != nil {
 				return err
 			}
-			msgCount++
+			msgCount += dumpedCount
 		}
 	}
 }

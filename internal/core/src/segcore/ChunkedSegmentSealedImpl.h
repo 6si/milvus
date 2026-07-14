@@ -112,6 +112,10 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     }
 
     void
+    FillPrimaryKeys(const query::Plan* plan,
+                    SearchResult& results) const override;
+
+    void
     AddFieldDataInfoForSealed(
         const LoadFieldDataInfo& field_data_info) override;
 
@@ -340,6 +344,14 @@ class ChunkedSegmentSealedImpl : public SegmentSealed {
     prefetch_chunks(milvus::OpContext* op_ctx,
                     FieldId field_id,
                     const std::vector<int64_t>& chunk_ids) const override;
+
+    void
+    ApplyFieldValidData(milvus::OpContext* op_ctx,
+                        FieldId field_id,
+                        int64_t chunk_id,
+                        int64_t offset,
+                        int64_t size,
+                        TargetBitmapView valid_result) const override;
 
  protected:
     // blob and row_count

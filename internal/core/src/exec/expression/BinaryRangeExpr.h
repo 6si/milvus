@@ -18,7 +18,13 @@
 
 #include <fmt/core.h>
 
+#include "bitset/bitset.h"
+#include "bitset/common.h"
+#include "cachinglayer/CacheSlot.h"
+#include "common/Array.h"
 #include "common/EasyAssert.h"
+#include "common/Json.h"
+#include "common/OpContext.h"
 #include "common/Types.h"
 #include "common/Vector.h"
 #include "exec/expression/Expr.h"
@@ -85,30 +91,45 @@ struct BinaryRangeElementFunc {
     }
 };
 
-#define BinaryRangeJSONCompare(cmp)                                \
-    do {                                                           \
-        if (valid_data != nullptr && !valid_data[offset]) {        \
-            res[i] = valid_res[i] = false;                         \
-            break;                                                 \
-        }                                                          \
-        if (has_bitmap_input && !bitmap_input[i + start_cursor]) { \
-            break;                                                 \
-        }                                                          \
-        auto x = src[offset].template at<GetType>(pointer);        \
-        if (x.error()) {                                           \
-            if constexpr (std::is_same_v<GetType, int64_t>) {      \
-                auto x = src[offset].template at<double>(pointer); \
-                if (!x.error()) {                                  \
-                    auto value = x.value();                        \
-                    res[i] = (cmp);                                \
-                    break;                                         \
-                }                                                  \
-            }                                                      \
-            res[i] = false;                                        \
-            break;                                                 \
-        }                                                          \
-        auto value = x.value();                                    \
-        res[i] = (cmp);                                            \
+// For int64_t GetType, uses at_numeric() (get_number()) to extract any JSON
+// number in a single parse.  Branches on actual type to preserve int64
+// precision; uint64 and double values fall back to double comparison,
+// consistent with the Tantivy index and JSON-stats paths.
+// 'cmp' must reference 'value' (int64_t or double depending on the JSON value).
+#define BinaryRangeJSONCompare(cmp)                                    \
+    do {                                                               \
+        if (valid_data != nullptr && !valid_data[offset]) {            \
+            res[i] = valid_res[i] = false;                             \
+            break;                                                     \
+        }                                                              \
+        if (has_bitmap_input && !bitmap_input[i + start_cursor]) {     \
+            break;                                                     \
+        }                                                              \
+        if constexpr (std::is_same_v<GetType, int64_t>) {              \
+            auto x = src[offset].at_numeric(pointer);                  \
+            if (x.error()) {                                           \
+                res[i] = valid_res[i] = false;                         \
+                break;                                                 \
+            }                                                          \
+            auto n = x.value();                                        \
+            if (n.is_int64()) {                                        \
+                auto value = n.get_int64();                            \
+                res[i] = (cmp);                                        \
+            } else {                                                   \
+                auto value = n.is_uint64()                             \
+                                 ? static_cast<double>(n.get_uint64()) \
+                                 : n.get_double();                     \
+                res[i] = (cmp);                                        \
+            }                                                          \
+        } else {                                                       \
+            auto x = src[offset].template at<GetType>(pointer);        \
+            if (x.error()) {                                           \
+                res[i] = valid_res[i] = false;                         \
+                break;                                                 \
+            }                                                          \
+            auto value = x.value();                                    \
+            res[i] = (cmp);                                            \
+        }                                                              \
     } while (false)
 
 template <typename ValueType,
@@ -171,6 +192,8 @@ struct BinaryRangeElementFuncForArray {
                size_t start_cursor,
                const int32_t* offsets = nullptr) {
         bool has_bitmap_input = !bitmap_input.empty();
+        AssertInfo(index >= 0,
+                   "array element range predicate requires nested path");
         for (size_t i = 0; i < n; ++i) {
             if (has_bitmap_input && !bitmap_input[i + start_cursor]) {
                 continue;
@@ -183,33 +206,19 @@ struct BinaryRangeElementFuncForArray {
                 res[i] = valid_res[i] = false;
                 continue;
             }
+            if (index >= src[offset].length()) {
+                res[i] = false;
+                valid_res[i] = false;
+                continue;
+            }
+            auto value = src[offset].get_data<GetType>(index);
             if constexpr (lower_inclusive && upper_inclusive) {
-                if (index >= src[offset].length()) {
-                    res[i] = false;
-                    continue;
-                }
-                auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 <= value && value <= val2;
             } else if constexpr (lower_inclusive && !upper_inclusive) {
-                if (index >= src[offset].length()) {
-                    res[i] = false;
-                    continue;
-                }
-                auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 <= value && value < val2;
             } else if constexpr (!lower_inclusive && upper_inclusive) {
-                if (index >= src[offset].length()) {
-                    res[i] = false;
-                    continue;
-                }
-                auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 < value && value <= val2;
             } else {
-                if (index >= src[offset].length()) {
-                    res[i] = false;
-                    continue;
-                }
-                auto value = src[offset].get_data<GetType>(index);
                 res[i] = val1 < value && value < val2;
             }
         }

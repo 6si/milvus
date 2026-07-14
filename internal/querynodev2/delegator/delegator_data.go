@@ -77,6 +77,11 @@ type DeleteData struct {
 	RowCount    int64
 }
 
+type DeleteBatch struct {
+	Ts   uint64
+	Data []*DeleteData
+}
+
 // Append appends another delete data into this one.
 func (d *DeleteData) Append(ad DeleteData) {
 	d.PrimaryKeys = append(d.PrimaryKeys, ad.PrimaryKeys...)
@@ -187,9 +192,16 @@ func (sd *shardDelegator) ProcessInsert(insertRecords map[int64]*InsertData) {
 // delegator puts deleteData into buffer first,
 // then dispatch data to segments according to the result of bloom filter check.
 func (sd *shardDelegator) ProcessDelete(deleteData []*DeleteData, ts uint64) {
+	sd.ProcessDeleteBatches([]DeleteBatch{{Ts: ts, Data: deleteData}})
+}
+
+func (sd *shardDelegator) ProcessDeleteBatches(batches []DeleteBatch) {
 	// Early return if delegator is stopped - ProcessDelete becomes a no-op
 	// This prevents unnecessary processing and side effects during shutdown
 	if sd.Stopped() {
+		return
+	}
+	if len(batches) == 0 {
 		return
 	}
 
@@ -201,26 +213,35 @@ func (sd *shardDelegator) ProcessDelete(deleteData []*DeleteData, ts uint64) {
 
 	log := sd.getLogger(context.Background())
 
-	log.Debug("start to process delete", zap.Uint64("ts", ts))
-	// add deleteData into buffer.
-	cacheItems := make([]deletebuffer.BufferItem, 0, len(deleteData))
-	for _, entry := range deleteData {
-		cacheItems = append(cacheItems, deletebuffer.BufferItem{
-			PartitionID: entry.PartitionID,
-			DeleteData: storage.DeleteData{
-				Pks:      entry.PrimaryKeys,
-				Tss:      entry.Timestamps,
-				RowCount: entry.RowCount,
-			},
+	log.Debug("start to process delete batches", zap.Int("batchNum", len(batches)))
+	allDeleteData := make([]*DeleteData, 0, len(batches))
+	for _, batch := range batches {
+		if len(batch.Data) == 0 {
+			continue
+		}
+
+		cacheItems := make([]deletebuffer.BufferItem, 0, len(batch.Data))
+		for _, entry := range batch.Data {
+			cacheItems = append(cacheItems, deletebuffer.BufferItem{
+				PartitionID: entry.PartitionID,
+				DeleteData: storage.DeleteData{
+					Pks:      entry.PrimaryKeys,
+					Tss:      entry.Timestamps,
+					RowCount: entry.RowCount,
+				},
+			})
+		}
+
+		sd.deleteBuffer.Put(&deletebuffer.Item{
+			Ts:   batch.Ts,
+			Data: cacheItems,
 		})
+		allDeleteData = append(allDeleteData, batch.Data...)
 	}
 
-	sd.deleteBuffer.Put(&deletebuffer.Item{
-		Ts:   ts,
-		Data: cacheItems,
-	})
-
-	sd.forwardStreamingDeletion(context.Background(), deleteData)
+	if len(allDeleteData) > 0 {
+		sd.forwardStreamingDeletion(context.Background(), allDeleteData)
+	}
 
 	metrics.QueryNodeProcessCost.WithLabelValues(fmt.Sprint(paramtable.GetNodeID()), metrics.DeleteLabel).
 		Observe(float64(tr.ElapseSpan().Milliseconds()))
@@ -1059,7 +1080,9 @@ func (sd *shardDelegator) TryCleanExcludedSegments(ts uint64) {
 
 func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, error) {
 	pb := &commonpb.PlaceholderGroup{}
-	proto.Unmarshal(req.GetPlaceholderGroup(), pb)
+	if err := proto.Unmarshal(req.GetPlaceholderGroup(), pb); err != nil {
+		return 0, merr.WrapErrParameterInvalidMsg("failed to unmarshal BM25 IDF placeholder group: %v", err)
+	}
 
 	if len(pb.Placeholders) != 1 || len(pb.Placeholders[0].Values) == 0 {
 		return 0, merr.WrapErrParameterInvalidMsg("please provide varchar/text for BM25 Function based search")
@@ -1067,14 +1090,16 @@ func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, 
 
 	holder := pb.Placeholders[0]
 	if holder.Type != commonpb.PlaceholderType_VarChar {
-		return 0, merr.WrapErrParameterInvalidMsg(fmt.Sprintf("please provide varchar/text for BM25 Function based search, got %s", holder.Type.String()))
+		return 0, merr.WrapErrParameterInvalidMsg("please provide varchar/text for BM25 Function based search, got %s", holder.Type.String())
 	}
 
 	texts := funcutil.GetVarCharFromPlaceholder(holder)
 	datas := []any{texts}
 	functionRunner, ok := sd.functionRunners[req.GetFieldId()]
 	if !ok {
-		return 0, fmt.Errorf("functionRunner not found for field: %d", req.GetFieldId())
+		// internal invariant: runners are populated with the schema, never by
+		// the request — classified system, keeps cross-replica failover
+		return 0, merr.WrapErrServiceInternalMsg("functionRunner not found for field: %d", req.GetFieldId())
 	}
 
 	if len(functionRunner.GetInputFields()) == 2 {
@@ -1099,7 +1124,7 @@ func (sd *shardDelegator) buildBM25IDF(req *internalpb.SearchRequest) (float64, 
 
 	tfArray, ok := output[0].(*schemapb.SparseFloatArray)
 	if !ok {
-		return 0, errors.New("functionRunner return unknown data")
+		return 0, merr.WrapErrServiceInternalMsg("functionRunner return unknown data")
 	}
 
 	idfSparseVector, avgdl, err := sd.idfOracle.BuildIDF(req.GetFieldId(), tfArray)
@@ -1138,7 +1163,7 @@ func (sd *shardDelegator) GetHighlight(ctx context.Context, req *querypb.GetHigh
 	result := []*querypb.HighlightResult{}
 	for _, task := range req.GetTasks() {
 		if len(task.GetTexts()) != int(task.GetSearchTextNum()+task.GetCorpusTextNum())+len(task.GetQueries()) {
-			return nil, errors.Errorf("package highlight texts error, num of texts not equal the expected num %d:%d", len(task.GetTexts()), int(task.GetSearchTextNum()+task.GetCorpusTextNum())+len(task.GetQueries()))
+			return nil, merr.WrapErrServiceInternalMsg("package highlight texts error, num of texts not equal the expected num %d:%d", len(task.GetTexts()), int(task.GetSearchTextNum()+task.GetCorpusTextNum())+len(task.GetQueries()))
 		}
 		analyzer, ok := sd.analyzerRunners[task.GetFieldId()]
 		if !ok {

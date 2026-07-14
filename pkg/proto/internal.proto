@@ -149,6 +149,8 @@ message SubSearchResults {
   int64 sliced_offset = 6;
   // to indicate it belongs to which sub request
   int64 req_index = 7;
+  // pre-decoded SearchResultData, avoids re-marshal/unmarshal between delegator and proxy
+  schema.SearchResultData result_data = 8;
 }
 
 message SearchResults {
@@ -176,6 +178,8 @@ message SearchResults {
   bool is_recall_evaluation = 19;
   int64 scanned_remote_bytes = 20;
   int64 scanned_total_bytes = 21;
+  // pre-decoded SearchResultData, avoids re-marshal/unmarshal between delegator and proxy
+  schema.SearchResultData result_data = 22;
 }
 
 message CostAggregation {
@@ -274,6 +278,7 @@ message CredentialInfo {
   // encrypted by sha256 (for good performance in cache mapping)
   string sha256_password = 5; // not save in metadata.
   uint64 time_tick = 6; // the timetick in wal which the credential updates
+  optional string description = 7;
 }
 
 message ListPolicyRequest {

@@ -557,8 +557,7 @@ class SegmentExpr : public Expr {
                                 valid_res + processed_size,
                                 values...);
                         } else {
-                            if (valid_data.size() > processed_size &&
-                                !valid_data[processed_size]) {
+                            if (!valid_data.empty() && !valid_data[0]) {
                                 res[processed_size] =
                                     valid_res[processed_size] = false;
                             }
@@ -1034,7 +1033,8 @@ class SegmentExpr : public Expr {
 
     template <typename IndexInnerType>
     IndexPtrResult<IndexInnerType>
-    GetIndexPtrForChunk(size_t chunk_id) {
+    GetIndexPtrForChunk(size_t chunk_id,
+                        bool use_comparable_value_mask = true) {
         using Index = index::ScalarIndex<IndexInnerType>;
         IndexPtrResult<IndexInnerType> result{nullptr, nullptr};
 
@@ -1050,7 +1050,8 @@ class SegmentExpr : public Expr {
                 auto index_path = json_flat_index->GetNestedPath();
                 result.executor =
                     json_flat_index->template create_executor<IndexInnerType>(
-                        pointer.substr(index_path.size()));
+                        pointer.substr(index_path.size()),
+                        use_comparable_value_mask);
                 result.index_ptr = result.executor.get();
             } else {
                 auto json_index = const_cast<index::IndexBase*>(json_pw.get());
@@ -1280,35 +1281,12 @@ class SegmentExpr : public Expr {
             size = std::min(size, batch_size_ - processed_size);
             if (size == 0)
                 continue;  //do not go empty-loop at the bound of the chunk
-            bool access_sealed_variable_column = false;
-            if constexpr (std::is_same_v<T, std::string_view> ||
-                          std::is_same_v<T, Json> ||
-                          std::is_same_v<T, ArrayView>) {
-                if (segment_->type() == SegmentType::Sealed) {
-                    auto pw = segment_->get_batch_views<T>(
-                        op_ctx_, field_id_, i, data_pos, size);
-                    auto [data_vec, valid_data] = pw.get();
-                    ApplyValidData(valid_data.data(),
-                                   valid_result + processed_size,
-                                   valid_result + processed_size,
-                                   size);
-                    access_sealed_variable_column = true;
-                }
-            }
-
-            if (!access_sealed_variable_column) {
-                auto pw = segment_->chunk_data<T>(op_ctx_, field_id_, i);
-                auto chunk = pw.get();
-                const bool* valid_data = chunk.valid_data();
-                if (valid_data == nullptr) {
-                    return valid_result;
-                }
-                valid_data += data_pos;
-                ApplyValidData(valid_data,
-                               valid_result + processed_size,
-                               valid_result + processed_size,
-                               size);
-            }
+            segment_->ApplyFieldValidData(op_ctx_,
+                                          field_id_,
+                                          i,
+                                          data_pos,
+                                          size,
+                                          valid_result + processed_size);
 
             processed_size += size;
             if (processed_size >= batch_size_) {
@@ -1357,7 +1335,8 @@ class SegmentExpr : public Expr {
             // It avoids indexing execute for every batch because indexing
             // executing costs quite much time.
             if (cached_index_chunk_id_ != i) {
-                auto index_result = GetIndexPtrForChunk<IndexInnerType>(i);
+                auto index_result =
+                    GetIndexPtrForChunk<IndexInnerType>(i, false);
                 Index* index_ptr = index_result.index_ptr;
 
                 auto execute_sub_batch = [](Index* index_ptr) {
@@ -1551,6 +1530,19 @@ class SegmentExpr : public Expr {
     CanUseNgramIndex() const {
         return false;
     };
+
+    VectorPtr
+    MoveOrSliceBitmap(TargetBitmap& cached_res,
+                      TargetBitmap& cached_valid_res,
+                      int64_t pos,
+                      int64_t size) {
+        TargetBitmap result;
+        TargetBitmap valid_result;
+        result.append(cached_res, pos, size);
+        valid_result.append(cached_valid_res, pos, size);
+        return std::make_shared<ColumnVector>(std::move(result),
+                                              std::move(valid_result));
+    }
 
  protected:
     const segcore::SegmentInternalInterface* segment_;

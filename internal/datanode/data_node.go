@@ -27,7 +27,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/errors"
 	"github.com/tidwall/gjson"
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"go.uber.org/zap"
@@ -39,12 +38,14 @@ import (
 	"github.com/milvus-io/milvus/internal/datanode/index"
 	"github.com/milvus-io/milvus/internal/flushcommon/syncmgr"
 	"github.com/milvus-io/milvus/internal/types"
+	"github.com/milvus-io/milvus/internal/util/analyzer"
 	"github.com/milvus-io/milvus/internal/util/sessionutil"
 	"github.com/milvus-io/milvus/pkg/v2/log"
 	"github.com/milvus-io/milvus/pkg/v2/metrics"
 	"github.com/milvus-io/milvus/pkg/v2/util/conc"
 	"github.com/milvus-io/milvus/pkg/v2/util/expr"
 	"github.com/milvus-io/milvus/pkg/v2/util/lifetime"
+	"github.com/milvus-io/milvus/pkg/v2/util/merr"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/paramtable"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -159,7 +160,7 @@ func (node *DataNode) Register() error {
 func (node *DataNode) initSession() error {
 	node.session = sessionutil.NewSession(node.ctx)
 	if node.session == nil {
-		return errors.New("failed to initialize session")
+		return merr.WrapErrServiceInternalMsg("failed to initialize session")
 	}
 	node.session.Init(typeutil.DataNodeRole, node.address, false, true)
 	sessionutil.SaveServerInfo(typeutil.DataNodeRole, node.session.ServerID)
@@ -197,6 +198,12 @@ func (node *DataNode) Init() error {
 		err := index.InitSegcore(serverID)
 		if err != nil {
 			initError = err
+			return
+		}
+		if err := analyzer.InitOptions(); err != nil {
+			log.Error("DataNode init analyzer options failed", zap.Error(err))
+			initError = err
+			return
 		}
 		log.Info("init datanode done", zap.String("Address", node.address))
 	})
@@ -254,7 +261,7 @@ func (node *DataNode) isHealthy() bool {
 // ReadyToFlush tells whether DataNode is ready for flushing
 func (node *DataNode) ReadyToFlush() error {
 	if !node.isHealthy() {
-		return errors.New("DataNode not in HEALTHY state")
+		return merr.Wrap(merr.ErrServiceNotReady, "DataNode not in HEALTHY state")
 	}
 	return nil
 }

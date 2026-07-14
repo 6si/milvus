@@ -25,7 +25,9 @@ import (
 	"github.com/apache/arrow/go/v17/parquet/pqarrow"
 
 	"github.com/milvus-io/milvus-proto/go-api/v2/schemapb"
+	importcommon "github.com/milvus-io/milvus/internal/util/importutilv2/common"
 	"github.com/milvus-io/milvus/pkg/v2/util/merr"
+	"github.com/milvus-io/milvus/pkg/v2/util/parameterutil"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
 )
 
@@ -98,7 +100,7 @@ func (r *StructFieldReader) Next(count int64) (any, any, error) {
 	case schemapb.DataType_ArrayOfVector:
 		return r.readArrayOfVectorField(chunked)
 	default:
-		return nil, nil, merr.WrapErrImportFailed(fmt.Sprintf("unsupported data type for struct field: %v", r.field.GetDataType()))
+		return nil, nil, merr.WrapErrImportFailedMsg("unsupported data type for struct field: %v", r.field.GetDataType())
 	}
 }
 
@@ -224,6 +226,11 @@ func (r *StructFieldReader) toScalarField(data []interface{}) (*schemapb.ScalarF
 
 func (r *StructFieldReader) readArrayField(chunked *arrow.Chunked) (any, any, error) {
 	result := make([]*schemapb.ScalarField, 0)
+	maxCapacity, err := parameterutil.GetMaxCapacity(r.field)
+	if err != nil {
+		return nil, nil, err
+	}
+
 	for _, chunk := range chunked.Chunks() {
 		listArray, ok := chunk.(*array.List)
 		if !ok {
@@ -241,6 +248,10 @@ func (r *StructFieldReader) readArrayField(chunked *arrow.Chunked) (any, any, er
 		for i := 0; i < len(offsets)-1; i++ {
 			startIdx := offsets[i]
 			endIdx := offsets[i+1]
+
+			if err = importcommon.CheckArrayCapacity(int(endIdx-startIdx), maxCapacity, r.field); err != nil {
+				return nil, nil, err
+			}
 
 			var combinedData []interface{}
 			for structIdx := startIdx; structIdx < endIdx; structIdx++ {
@@ -298,6 +309,10 @@ func (r *StructFieldReader) readArrayOfVectorField(chunked *arrow.Chunked) (any,
 	if r.field.GetNullable() {
 		return nil, nil, merr.WrapErrImportFailed("ArrayOfVector does not support nullable")
 	}
+	maxCapacity, err := parameterutil.GetMaxCapacity(r.field)
+	if err != nil {
+		return nil, nil, err
+	}
 	var result []*schemapb.VectorField
 
 	for _, chunk := range chunked.Chunks() {
@@ -324,41 +339,97 @@ func (r *StructFieldReader) readArrayOfVectorField(chunked *arrow.Chunked) (any,
 			startIdx := offsets[i]
 			endIdx := offsets[i+1]
 
+			if err = importcommon.CheckArrayCapacity(int(endIdx-startIdx), maxCapacity, r.field); err != nil {
+				return nil, nil, err
+			}
+
 			// Extract vectors based on element type
 			switch r.field.GetElementType() {
 			case schemapb.DataType_FloatVector:
 				var allVectors []float32
 				for structIdx := startIdx; structIdx < endIdx; structIdx++ {
 					vecStart, vecEnd := fieldArray.ValueOffsets(int(structIdx))
-					if floatArr, ok := fieldArray.ListValues().(*array.Float32); ok {
+					if int(vecEnd-vecStart) != r.dim {
+						return nil, nil, merr.WrapErrImportFailed(
+							fmt.Sprintf("vector dimension mismatch for field '%s': position=%d, actual=%d, expected=%d",
+								r.field.GetName(), structIdx, vecEnd-vecStart, r.dim))
+					}
+					switch floatArr := fieldArray.ListValues().(type) {
+					case *array.Float32:
 						for j := vecStart; j < vecEnd; j++ {
+							if floatArr.IsNull(int(j)) {
+								return nil, nil, WrapNullElementErr(r.field)
+							}
 							allVectors = append(allVectors, floatArr.Value(int(j)))
 						}
+					case *array.Float64:
+						for j := vecStart; j < vecEnd; j++ {
+							if floatArr.IsNull(int(j)) {
+								return nil, nil, WrapNullElementErr(r.field)
+							}
+							allVectors = append(allVectors, float32(floatArr.Value(int(j))))
+						}
+					default:
+						return nil, nil, merr.WrapErrImportFailed(
+							fmt.Sprintf("expected Float32 or Float64 array for FloatVector field '%s', got %T",
+								r.field.GetName(), fieldArray.ListValues()))
 					}
 				}
-				// struct list could be empty, len(allVectors) can be zero
-				// build an empty VectorField if len(allVectors) is zero
-				if len(allVectors) >= 0 {
-					vectorField := &schemapb.VectorField{
-						Dim: int64(r.dim),
-						Data: &schemapb.VectorField_FloatVector{
-							FloatVector: &schemapb.FloatArray{Data: allVectors},
-						},
-					}
-					result = append(result, vectorField)
+				vectorField := &schemapb.VectorField{
+					Dim: int64(r.dim),
+					Data: &schemapb.VectorField_FloatVector{
+						FloatVector: &schemapb.FloatArray{Data: allVectors},
+					},
 				}
+				result = append(result, vectorField)
 
 			case schemapb.DataType_BinaryVector:
-				return nil, nil, merr.WrapErrImportFailed("ArrayOfVector with BinaryVector element type is not implemented yet")
+				allVectors, err := readUint8ArrayOfVectorField(r.field, fieldArray, startIdx, endIdx, int64((r.dim+7)/8))
+				if err != nil {
+					return nil, nil, err
+				}
+				result = append(result, &schemapb.VectorField{
+					Dim: int64(r.dim),
+					Data: &schemapb.VectorField_BinaryVector{
+						BinaryVector: allVectors,
+					},
+				})
 
 			case schemapb.DataType_Float16Vector:
-				return nil, nil, merr.WrapErrImportFailed("ArrayOfVector with Float16Vector element type is not implemented yet")
+				allVectors, err := readUint8ArrayOfVectorField(r.field, fieldArray, startIdx, endIdx, int64(r.dim*2))
+				if err != nil {
+					return nil, nil, err
+				}
+				result = append(result, &schemapb.VectorField{
+					Dim: int64(r.dim),
+					Data: &schemapb.VectorField_Float16Vector{
+						Float16Vector: allVectors,
+					},
+				})
 
 			case schemapb.DataType_BFloat16Vector:
-				return nil, nil, merr.WrapErrImportFailed("ArrayOfVector with BFloat16Vector element type is not implemented yet")
+				allVectors, err := readUint8ArrayOfVectorField(r.field, fieldArray, startIdx, endIdx, int64(r.dim*2))
+				if err != nil {
+					return nil, nil, err
+				}
+				result = append(result, &schemapb.VectorField{
+					Dim: int64(r.dim),
+					Data: &schemapb.VectorField_Bfloat16Vector{
+						Bfloat16Vector: allVectors,
+					},
+				})
 
 			case schemapb.DataType_Int8Vector:
-				return nil, nil, merr.WrapErrImportFailed("ArrayOfVector with Int8Vector element type is not implemented yet")
+				allVectors, err := readInt8ArrayOfVectorField(r.field, fieldArray, startIdx, endIdx, int64(r.dim))
+				if err != nil {
+					return nil, nil, err
+				}
+				result = append(result, &schemapb.VectorField{
+					Dim: int64(r.dim),
+					Data: &schemapb.VectorField_Int8Vector{
+						Int8Vector: allVectors,
+					},
+				})
 
 			case schemapb.DataType_SparseFloatVector:
 				return nil, nil, merr.WrapErrImportFailed("ArrayOfVector with SparseFloatVector element type is not implemented yet")
@@ -370,4 +441,70 @@ func (r *StructFieldReader) readArrayOfVectorField(chunked *arrow.Chunked) (any,
 	}
 
 	return result, nil, nil
+}
+
+func arrayOfVectorValueOffsets(field *schemapb.FieldSchema, fieldArray *array.List, vectorIndex int32, expected int64, isByteWidth bool) (int64, int64, error) {
+	if fieldArray.IsNull(int(vectorIndex)) {
+		return 0, 0, WrapNullElementErr(field)
+	}
+	vecStart, vecEnd := fieldArray.ValueOffsets(int(vectorIndex))
+	if vecEnd-vecStart != expected {
+		if isByteWidth {
+			return 0, 0, merr.WrapErrImportFailed(
+				fmt.Sprintf("vector dimension mismatch for field '%s': position=%d, actual_bytes=%d, expected_bytes=%d",
+					field.GetName(), vectorIndex, vecEnd-vecStart, expected))
+		}
+		return 0, 0, merr.WrapErrImportFailed(
+			fmt.Sprintf("vector dimension mismatch for field '%s': position=%d, actual=%d, expected=%d",
+				field.GetName(), vectorIndex, vecEnd-vecStart, expected))
+	}
+	return vecStart, vecEnd, nil
+}
+
+func readUint8ArrayOfVectorField(field *schemapb.FieldSchema, fieldArray *array.List, startIdx, endIdx int32, expectedBytes int64) ([]byte, error) {
+	uint8Arr, ok := fieldArray.ListValues().(*array.Uint8)
+	if !ok {
+		return nil, merr.WrapErrImportFailed(
+			fmt.Sprintf("expected Uint8 array for %s field '%s', got %T",
+				field.GetElementType().String(), field.GetName(), fieldArray.ListValues()))
+	}
+
+	allVectors := make([]byte, 0, int(endIdx-startIdx)*int(expectedBytes))
+	for structIdx := startIdx; structIdx < endIdx; structIdx++ {
+		vecStart, vecEnd, err := arrayOfVectorValueOffsets(field, fieldArray, structIdx, expectedBytes, true)
+		if err != nil {
+			return nil, err
+		}
+		for j := vecStart; j < vecEnd; j++ {
+			if uint8Arr.IsNull(int(j)) {
+				return nil, WrapNullElementErr(field)
+			}
+		}
+		allVectors = append(allVectors, uint8Arr.Uint8Values()[vecStart:vecEnd]...)
+	}
+	return allVectors, nil
+}
+
+func readInt8ArrayOfVectorField(field *schemapb.FieldSchema, fieldArray *array.List, startIdx, endIdx int32, expectedDim int64) ([]byte, error) {
+	int8Arr, ok := fieldArray.ListValues().(*array.Int8)
+	if !ok {
+		return nil, merr.WrapErrImportFailed(
+			fmt.Sprintf("expected Int8 array for Int8Vector field '%s', got %T",
+				field.GetName(), fieldArray.ListValues()))
+	}
+
+	allVectors := make([]byte, 0, int(endIdx-startIdx)*int(expectedDim))
+	for structIdx := startIdx; structIdx < endIdx; structIdx++ {
+		vecStart, vecEnd, err := arrayOfVectorValueOffsets(field, fieldArray, structIdx, expectedDim, false)
+		if err != nil {
+			return nil, err
+		}
+		for j := vecStart; j < vecEnd; j++ {
+			if int8Arr.IsNull(int(j)) {
+				return nil, WrapNullElementErr(field)
+			}
+			allVectors = append(allVectors, byte(int8Arr.Value(int(j))))
+		}
+	}
+	return allVectors, nil
 }

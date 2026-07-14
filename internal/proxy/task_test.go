@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"math/rand"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -1297,7 +1298,7 @@ func TestCreateCollectionTask(t *testing.T) {
 		Params.Save(Params.ProxyCfg.MustUsePartitionKey.Key, "true")
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
-		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.ErrorIs(t, err, merr.ErrParameterMissing)
 		Params.Reset(Params.ProxyCfg.MustUsePartitionKey.Key)
 
 		task.Schema = []byte{0x1, 0x2, 0x3, 0x4}
@@ -1390,6 +1391,14 @@ func TestCreateCollectionTask(t *testing.T) {
 		task.Schema = tooLongNameSchema
 		err = task.PreExecute(ctx)
 		assert.Error(t, err)
+
+		schema = proto.Clone(schemaBackup).(*schemapb.CollectionSchema)
+		schema.Description = strings.Repeat("a", Params.ProxyCfg.MaxCollectionDescriptionLength.GetAsInt()+1)
+		tooLongDescriptionSchema, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+		task.Schema = tooLongDescriptionSchema
+		err = task.PreExecute(ctx)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
 
 		schema.Name = "$" // invalid first char
 		invalidFirstCharSchema, err := proto.Marshal(schema)
@@ -4750,6 +4759,105 @@ func TestAlterCollectionCheckLoaded(t *testing.T) {
 	assert.Equal(t, merr.Code(merr.ErrCollectionLoaded), merr.Code(err))
 }
 
+func TestAlterCollectionTaskValidateDescription(t *testing.T) {
+	qc := NewMixCoordMock()
+	ctx := context.Background()
+	cache := globalMetaCache
+	defer func() { globalMetaCache = cache }()
+	err := InitMetaCache(ctx, qc)
+	assert.NoError(t, err)
+
+	maxLen := Params.ProxyCfg.MaxCollectionDescriptionLength.GetAsInt()
+	oversized := strings.Repeat("a", maxLen+1)
+	differentOversized := strings.Repeat("b", maxLen+1)
+
+	// Create a collection through the mock coordinator directly so we can seed a
+	// pre-existing oversized description, which the proxy CreateCollection guard
+	// would normally reject. This simulates a collection created before the
+	// description length limit existed.
+	createCollection := func(description string) string {
+		collectionName := "alter_description_" + funcutil.GenRandomStr()
+		schema := &schemapb.CollectionSchema{
+			Name:        collectionName,
+			Description: description,
+			AutoID:      false,
+			Fields: []*schemapb.FieldSchema{
+				{FieldID: 100, Name: "pk", IsPrimaryKey: true, DataType: schemapb.DataType_Int64},
+				{FieldID: 101, Name: "vec", DataType: schemapb.DataType_FloatVector, TypeParams: []*commonpb.KeyValuePair{{Key: common.DimKey, Value: "8"}}},
+			},
+		}
+		bs, err := proto.Marshal(schema)
+		assert.NoError(t, err)
+		status, err := qc.CreateCollection(ctx, &milvuspb.CreateCollectionRequest{
+			Base:           &commonpb.MsgBase{MsgType: commonpb.MsgType_CreateCollection},
+			DbName:         dbName,
+			CollectionName: collectionName,
+			Schema:         bs,
+			ShardsNum:      1,
+		})
+		assert.NoError(t, err)
+		assert.Equal(t, commonpb.ErrorCode_Success, status.GetErrorCode())
+		return collectionName
+	}
+
+	runAlter := func(collectionName string, properties []*commonpb.KeyValuePair) error {
+		task := &alterCollectionTask{
+			AlterCollectionRequest: &milvuspb.AlterCollectionRequest{
+				Base:           &commonpb.MsgBase{},
+				CollectionName: collectionName,
+				Properties:     properties,
+			},
+			ctx:      ctx,
+			mixCoord: qc,
+		}
+		return task.PreExecute(ctx)
+	}
+
+	// A collection whose stored description is within the limit.
+	validCollection := createCollection("short description")
+	// A collection whose stored description already exceeds the current limit.
+	legacyCollection := createCollection(oversized)
+
+	t.Run("changing a valid description to an oversized one is rejected", func(t *testing.T) {
+		err := runAlter(validCollection, []*commonpb.KeyValuePair{
+			{Key: common.CollectionDescription, Value: oversized},
+		})
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("resending an unchanged oversized description while altering TTL is accepted", func(t *testing.T) {
+		err := runAlter(legacyCollection, []*commonpb.KeyValuePair{
+			{Key: common.CollectionDescription, Value: oversized},
+			{Key: common.CollectionTTLConfigKey, Value: "10"},
+		})
+		assert.NoError(t, err)
+	})
+
+	t.Run("changing an oversized description to a different oversized value is rejected", func(t *testing.T) {
+		err := runAlter(legacyCollection, []*commonpb.KeyValuePair{
+			{Key: common.CollectionDescription, Value: differentOversized},
+		})
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+
+	t.Run("shrinking an oversized description to a valid value is accepted", func(t *testing.T) {
+		err := runAlter(legacyCollection, []*commonpb.KeyValuePair{
+			{Key: common.CollectionDescription, Value: "now within the limit"},
+		})
+		assert.NoError(t, err)
+	})
+
+	t.Run("with duplicate description keys, a changed oversized value is still rejected", func(t *testing.T) {
+		// The unchanged value is skipped, but the other (changed) oversized value
+		// is still validated per-property, so the alter is rejected.
+		err := runAlter(legacyCollection, []*commonpb.KeyValuePair{
+			{Key: common.CollectionDescription, Value: oversized},
+			{Key: common.CollectionDescription, Value: differentOversized},
+		})
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+	})
+}
+
 func mockVectorIndexForCollection(t *testing.T, ctx context.Context, qc *MixCoordMock, colName string) {
 	t.Helper()
 
@@ -5346,6 +5454,8 @@ func TestAlterCollectionFieldCheckLoaded(t *testing.T) {
 }
 
 func TestAlterCollectionField(t *testing.T) {
+	paramtable.Init()
+
 	qc := NewMixCoordMock()
 	InitMetaCache(context.Background(), qc)
 	collectionName := "test_alter_collection_field"
@@ -5556,6 +5666,27 @@ func TestAlterCollectionField(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("update array field max_capacity with custom limit", func(t *testing.T) {
+		err := paramtable.Get().Save(paramtable.Get().ProxyCfg.MaxArrayCapacity.Key, "5000")
+		assert.NoError(t, err)
+		defer paramtable.Get().Reset(paramtable.Get().ProxyCfg.MaxArrayCapacity.Key)
+
+		task := &alterCollectionFieldTask{
+			AlterCollectionFieldRequest: &milvuspb.AlterCollectionFieldRequest{
+				Base:           &commonpb.MsgBase{},
+				CollectionName: collectionName,
+				FieldName:      "array_field",
+				Properties: []*commonpb.KeyValuePair{
+					{Key: common.MaxCapacityKey, Value: "5000"},
+				},
+			},
+			mixCoord: qc,
+		}
+
+		err = task.PreExecute(context.Background())
+		assert.NoError(t, err)
+	})
 }
 
 // constructCollectionSchemaWithStructArrayField constructs a collection schema specifically for testing StructArrayField

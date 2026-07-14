@@ -122,6 +122,13 @@ class SegmentGrowingImpl : public SegmentGrowing {
     Load(milvus::tracer::TraceContext& trace_ctx,
          milvus::OpContext* op_ctx = nullptr) override;
 
+    // Backfill fields that exist in the schema but had no data to load,
+    // e.g. fields added by AddField after the loaded binlogs were written.
+    // Nullable vector fields get their validity bitmap filled so queries
+    // observe all-null values instead of an uninitialized column.
+    void
+    FillAbsentFields();
+
  private:
     // Build geometry cache for inserted data
     void
@@ -554,6 +561,14 @@ class SegmentGrowingImpl : public SegmentGrowing {
                              FieldId field_id,
                              const int64_t* seg_offsets,
                              int64_t count) const;
+
+    void
+    ApplyFieldValidData(milvus::OpContext* op_ctx,
+                        FieldId field_id,
+                        int64_t chunk_id,
+                        int64_t offset,
+                        int64_t size,
+                        TargetBitmapView valid_result) const override;
 
  protected:
     int64_t

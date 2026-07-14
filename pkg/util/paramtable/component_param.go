@@ -32,6 +32,7 @@ import (
 
 	"github.com/milvus-io/milvus/pkg/v2/config"
 	"github.com/milvus-io/milvus/pkg/v2/log"
+	"github.com/milvus-io/milvus/pkg/v2/util/fips"
 	"github.com/milvus-io/milvus/pkg/v2/util/hardware"
 	"github.com/milvus-io/milvus/pkg/v2/util/metricsinfo"
 	"github.com/milvus-io/milvus/pkg/v2/util/typeutil"
@@ -40,6 +41,7 @@ import (
 const (
 	// DefaultIndexSliceSize defines the default slice size of index file when serializing.
 	DefaultIndexSliceSize                      = 16
+	DefaultStreamBudgetRatio                   = 3.0
 	DefaultGracefulTime                        = 5000 // ms
 	DefaultGracefulStopTimeout                 = 1800 // s, for node
 	DefaultProxyGracefulStopTimeout            = 30   // s，for proxy
@@ -127,6 +129,10 @@ func (p *ComponentParam) init(bt *BaseTable) {
 	p.ServiceParam.init(bt)
 
 	p.CommonCfg.init(bt)
+	if fips.MaybeEnableOpenSSLFIPS() && !p.MinioCfg.UseCRC32C.GetAsBool() {
+		log.Warn("FIPS mode requires CRC32C checksum for S3 PutObject requests; override minio.ssl.useCRC32C to true at runtime")
+		p.MinioCfg.UseCRC32C.SwapTempValue("true")
+	}
 	p.QuotaConfig.init(bt)
 	p.AutoIndexConfig.init(bt)
 	p.TraceCfg.init(bt)
@@ -228,6 +234,7 @@ type commonConfig struct {
 	EntityExpirationTTL  ParamItem `refreshable:"true"`
 
 	IndexSliceSize                      ParamItem `refreshable:"false"`
+	StreamBudgetRatio                   ParamItem `refreshable:"true"`
 	HighPriorityThreadCoreCoefficient   ParamItem `refreshable:"true"`
 	MiddlePriorityThreadCoreCoefficient ParamItem `refreshable:"true"`
 	LowPriorityThreadCoreCoefficient    ParamItem `refreshable:"true"`
@@ -570,6 +577,15 @@ This configuration is only used by querynode and indexnode, it selects CPU instr
 		Export:       true,
 	}
 	p.IndexSliceSize.Init(base.mgr)
+
+	p.StreamBudgetRatio = ParamItem{
+		Key:          "common.entryStream.streamBudgetRatio",
+		Version:      "3.0.0",
+		DefaultValue: fmt.Sprintf("%f", DefaultStreamBudgetRatio),
+		Doc:          "Multiplier for entry stream transient memory budget, relative to CPU core count",
+		Export:       true,
+	}
+	p.StreamBudgetRatio.Init(base.mgr)
 
 	p.EnableMaterializedView = ParamItem{
 		Key:          "common.materializedView.enabled",
@@ -1370,7 +1386,7 @@ This helps Milvus-CDC synchronize incremental data`,
 	p.EnabledJSONKeyStats = ParamItem{
 		Key:          "common.enabledJSONShredding",
 		Version:      "2.6.5",
-		DefaultValue: "false",
+		DefaultValue: "true",
 		Doc:          "Indicates sealedsegment whether to enable JSON key stats",
 		FallbackKeys: []string{"common.enabledJSONKeyStats"},
 		Export:       true,
@@ -1995,7 +2011,9 @@ type proxyConfig struct {
 	HealthCheckTimeout             ParamItem `refreshable:"true"`
 	MsgStreamTimeTickBufSize       ParamItem `refreshable:"true"`
 	MaxNameLength                  ParamItem `refreshable:"true"`
+	MaxCollectionDescriptionLength ParamItem `refreshable:"true"`
 	MaxUsernameLength              ParamItem `refreshable:"true"`
+	MaxUserDescriptionLength       ParamItem `refreshable:"true"`
 	MinPasswordLength              ParamItem `refreshable:"true"`
 	MaxPasswordLength              ParamItem `refreshable:"true"`
 	MaxFieldNum                    ParamItem `refreshable:"true"`
@@ -2006,6 +2024,7 @@ type proxyConfig struct {
 	GinLogSkipPaths                ParamItem `refreshable:"false"`
 	MaxUserNum                     ParamItem `refreshable:"true"`
 	MaxRoleNum                     ParamItem `refreshable:"true"`
+	MaxRoleDescriptionLength       ParamItem `refreshable:"true"`
 	NameValidationAllowedChars     ParamItem `refreshable:"true"`
 	RoleNameValidationAllowedChars ParamItem `refreshable:"true"`
 	MaxTaskNum                     ParamItem `refreshable:"false"`
@@ -2025,6 +2044,7 @@ type proxyConfig struct {
 	SkipPartitionKeyCheck          ParamItem `refreshable:"true"`
 	MaxVarCharLength               ParamItem `refreshable:"false"`
 	MaxTextLength                  ParamItem `refreshable:"false"`
+	MaxArrayCapacity               ParamItem `refreshable:"true"`
 	MaxResultEntries               ParamItem `refreshable:"true"`
 	EnableCachedServiceProvider    ParamItem `refreshable:"true"`
 	ResolveAliasForPrivilege       ParamItem `refreshable:"true"`
@@ -2086,6 +2106,16 @@ func (p *proxyConfig) init(base *BaseTable) {
 	}
 	p.MaxNameLength.Init(base.mgr)
 
+	p.MaxCollectionDescriptionLength = ParamItem{
+		Key:          "proxy.maxCollectionDescriptionLength",
+		DefaultValue: "1024",
+		Version:      "2.6.0",
+		PanicIfEmpty: true,
+		Doc:          "The maximum byte length of a collection description accepted by CreateCollection and AlterCollection. Existing collection metadata is not revalidated, but restore or replication flows that recreate a collection through CreateCollection must satisfy this limit or raise it first.",
+		Export:       true,
+	}
+	p.MaxCollectionDescriptionLength.Init(base.mgr)
+
 	p.MinPasswordLength = ParamItem{
 		Key:          "proxy.minPasswordLength",
 		DefaultValue: "6",
@@ -2101,6 +2131,14 @@ func (p *proxyConfig) init(base *BaseTable) {
 		PanicIfEmpty: true,
 	}
 	p.MaxUsernameLength.Init(base.mgr)
+
+	p.MaxUserDescriptionLength = ParamItem{
+		Key:          "proxy.maxUserDescriptionLength",
+		DefaultValue: "1024",
+		Version:      "2.6.19",
+		PanicIfEmpty: true,
+	}
+	p.MaxUserDescriptionLength.Init(base.mgr)
 
 	p.MaxPasswordLength = ParamItem{
 		Key:          "proxy.maxPasswordLength",
@@ -2222,6 +2260,16 @@ please adjust in embedded Milvus: false`,
 		PanicIfEmpty: true,
 	}
 	p.MaxRoleNum.Init(base.mgr)
+
+	p.MaxRoleDescriptionLength = ParamItem{
+		Key:          "proxy.maxRoleDescriptionLength",
+		DefaultValue: "1024",
+		Version:      "2.6.19",
+		PanicIfEmpty: true,
+		Doc:          "Maximum role description length in bytes.",
+		Export:       true,
+	}
+	p.MaxRoleDescriptionLength.Init(base.mgr)
 
 	p.NameValidationAllowedChars = ParamItem{
 		Key:          "proxy.nameValidation.allowedChars",
@@ -2475,6 +2523,22 @@ please adjust in embedded Milvus: false`,
 	}
 	p.MaxTextLength.Init(base.mgr)
 
+	p.MaxArrayCapacity = ParamItem{
+		Key:          "proxy.maxArrayCapacity",
+		Version:      "2.6.19",
+		DefaultValue: "4096",
+		PanicIfEmpty: true,
+		Doc:          "maximum number of elements in an array field for a single row",
+		Export:       true,
+		Formatter: func(v string) string {
+			if getAsInt64(v) <= 0 {
+				return "4096"
+			}
+			return v
+		},
+	}
+	p.MaxArrayCapacity.Init(base.mgr)
+
 	p.MaxResultEntries = ParamItem{
 		Key:          "proxy.maxResultEntries",
 		Version:      "2.6.0",
@@ -2595,6 +2659,7 @@ type queryCoordConfig struct {
 	ChannelTaskTimeout         ParamItem `refreshable:"true"`
 	SegmentTaskTimeout         ParamItem `refreshable:"true"`
 	DistPullInterval           ParamItem `refreshable:"false"`
+	DispatchInterval           ParamItem `refreshable:"false"`
 	HeartbeatAvailableInterval ParamItem `refreshable:"true"`
 	LoadTimeoutSeconds         ParamItem `refreshable:"true"`
 
@@ -2626,13 +2691,14 @@ type queryCoordConfig struct {
 	StoppingBalanceAssignPolicy    ParamItem `refreshable:"true"`
 	ChannelExclusiveNodeFactor     ParamItem `refreshable:"true"`
 
-	CollectionObserverInterval         ParamItem `refreshable:"false"`
-	CollectionBalanceSegmentBatchSize  ParamItem `refreshable:"true"`
-	CollectionBalanceChannelBatchSize  ParamItem `refreshable:"true"`
-	UpdateCollectionLoadStatusInterval ParamItem `refreshable:"false"`
-	ClusterLevelLoadReplicaNumber      ParamItem `refreshable:"true"`
-	ClusterLevelLoadResourceGroups     ParamItem `refreshable:"true"`
-	ClusterLevelLoadWaitRGReadyTimeout ParamItem `refreshable:"true"`
+	CollectionObserverInterval                   ParamItem `refreshable:"false"`
+	CollectionBalanceSegmentBatchSize            ParamItem `refreshable:"true"`
+	CollectionBalanceChannelBatchSize            ParamItem `refreshable:"true"`
+	UpdateCollectionLoadStatusInterval           ParamItem `refreshable:"false"`
+	ClusterLevelLoadReplicaNumber                ParamItem `refreshable:"true"`
+	ClusterLevelLoadResourceGroups               ParamItem `refreshable:"true"`
+	ClusterLevelLoadForceOverrideUserReplicaMode ParamItem `refreshable:"true"`
+	ClusterLevelLoadWaitRGReadyTimeout           ParamItem `refreshable:"true"`
 
 	// balance batch size in one trigger
 	BalanceSegmentBatchSize            ParamItem `refreshable:"true"`
@@ -2724,7 +2790,7 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	p.Balancer = ParamItem{
 		Key:          "queryCoord.balancer",
 		Version:      "2.0.0",
-		DefaultValue: "ScoreBasedBalancer",
+		DefaultValue: "ChannelLevelScoreBalancer",
 		PanicIfEmpty: false,
 		Doc:          "auto balancer used for segments on queryNodes",
 		Export:       true,
@@ -2976,6 +3042,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	}
 	p.DistPullInterval.Init(base.mgr)
 
+	p.DispatchInterval = ParamItem{
+		Key:          "queryCoord.dispatchInterval",
+		Version:      "2.6.0",
+		DefaultValue: "500",
+		PanicIfEmpty: true,
+		Export:       true,
+	}
+	p.DispatchInterval.Init(base.mgr)
+
 	p.LoadTimeoutSeconds = ParamItem{
 		Key:          "queryCoord.loadTimeoutSeconds",
 		Version:      "2.0.0",
@@ -3190,8 +3265,8 @@ If this parameter is set false, Milvus simply searches the growing segments with
 	p.ChannelExclusiveNodeFactor = ParamItem{
 		Key:          "queryCoord.channelExclusiveNodeFactor",
 		Version:      "2.4.2",
-		DefaultValue: "4",
-		Doc:          "the least node number for enable channel's exclusive mode",
+		DefaultValue: "3",
+		Doc:          "minimum RW QueryNode count per channel required to enable channel exclusive mode",
 		Export:       true,
 	}
 	p.ChannelExclusiveNodeFactor.Init(base.mgr)
@@ -3240,6 +3315,15 @@ If this parameter is set false, Milvus simply searches the growing segments with
 		Export:       false,
 	}
 	p.ClusterLevelLoadResourceGroups.Init(base.mgr)
+
+	p.ClusterLevelLoadForceOverrideUserReplicaMode = ParamItem{
+		Key:          "queryCoord.clusterLevelLoadForceOverrideUserReplicaMode",
+		Version:      "2.6.14",
+		DefaultValue: "false",
+		Doc:          "when true and cluster-level load replica/RG config is complete, new load requests use the cluster-level load config even if users specify replica number or resource groups. Existing user-specified collections are taken over when they need a load-config update; collections already matching the cluster-level config may not be rewritten immediately, so their user-specified marker can remain until a later update. This is a one-way takeover: once a collection is updated, it is converted to cluster-level managed mode and turning this back off will not restore the previous user-specified replica mode.",
+		Export:       false,
+	}
+	p.ClusterLevelLoadForceOverrideUserReplicaMode.Init(base.mgr)
 
 	p.ClusterLevelLoadWaitRGReadyTimeout = ParamItem{
 		Key:          "queryCoord.clusterLevelLoadWaitRGReadyTimeout",
@@ -3462,6 +3546,8 @@ type queryNodeConfig struct {
 	CPURatio              ParamItem `refreshable:"true"`
 	GracefulStopTimeout   ParamItem `refreshable:"false"`
 
+	EnableResultZeroCopy ParamItem `refreshable:"true"`
+
 	// tsafe
 	MaxTimestampLag           ParamItem `refreshable:"true"`
 	DowngradeTsafe            ParamItem `refreshable:"true"`
@@ -3513,6 +3599,7 @@ type queryNodeConfig struct {
 	CleanExcludeSegInterval ParamItem `refreshable:"false"`
 	FlowGraphMaxQueueLength ParamItem `refreshable:"false"`
 	FlowGraphMaxParallelism ParamItem `refreshable:"false"`
+	DMLMicroBatchMaxMsgNum  ParamItem `refreshable:"true"`
 
 	MemoryIndexLoadPredictMemoryUsageFactor ParamItem `refreshable:"true"`
 	EnableSegmentPrune                      ParamItem `refreshable:"true"`
@@ -3606,6 +3693,15 @@ func (p *queryNodeConfig) init(base *BaseTable) {
 		Export:       true,
 	}
 	p.FlowGraphMaxParallelism.Init(base.mgr)
+
+	p.DMLMicroBatchMaxMsgNum = ParamItem{
+		Key:          "queryNode.dataSync.dmlMicroBatch.maxMsgNum",
+		Version:      "2.6.20",
+		DefaultValue: "8",
+		Doc:          "Maximum number of DML messages in one micro-batch drained by query node data sync pipeline. The batcher only drains already buffered messages and does not wait for more messages.",
+		Export:       true,
+	}
+	p.DMLMicroBatchMaxMsgNum.Init(base.mgr)
 
 	p.StatsPublishInterval = ParamItem{
 		Key:          "queryNode.stats.publishInterval",
@@ -4381,7 +4477,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.MaxGroupNQ = ParamItem{
 		Key:          "queryNode.grouping.maxNQ",
 		Version:      "2.0.0",
-		DefaultValue: "16",
+		DefaultValue: "64",
 		Export:       true,
 	}
 	p.MaxGroupNQ.Init(base.mgr)
@@ -4389,7 +4485,7 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 	p.NQMergeRatio = ParamItem{
 		Key:          "queryNode.grouping.nqMergeRatio",
 		Version:      "2.6.17",
-		DefaultValue: "3.0",
+		DefaultValue: "16.0",
 		Doc:          "Maximum ratio between merged total NQ and the smaller task NQ when grouping query node read tasks.",
 		Export:       true,
 	}
@@ -4412,6 +4508,15 @@ Max read concurrency must greater than or equal to 1, and less than or equal to 
 		Export:       true,
 	}
 	p.TopKMergeRatio.Init(base.mgr)
+
+	p.EnableResultZeroCopy = ParamItem{
+		Key:          "queryNode.search.enableResultZeroCopy",
+		Version:      "2.6.14",
+		DefaultValue: "false",
+		Doc:          "When true, delegator passes reduced SearchResultData directly instead of re-marshaling to SlicedBlob. Toggle at runtime for instant fallback.",
+		Export:       true,
+	}
+	p.EnableResultZeroCopy.Init(base.mgr)
 
 	p.CPURatio = ParamItem{
 		Key:          "queryNode.scheduler.cpuRatio",

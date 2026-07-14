@@ -60,9 +60,26 @@ const (
 
 var errSessionVersionCheckFailure = errors.New("session version check failure")
 
+// errSessionExpiredAtClientSide is a keepalive deadline cause compared by
+// identity via errors.Is(context.Cause(ctx), ...). It must stay a bare
+// package-level sentinel rather than a merr error: merr's errors.Is walks the
+// wrappedMilvusError/code chain and would not preserve this identity check.
+var errSessionExpiredAtClientSide = errors.New("session expired at client side")
+
 // isNotSessionVersionCheckFailure checks if the error is not a session version check failure.
 func isNotSessionVersionCheckFailure(err error) bool {
 	return !errors.Is(err, errSessionVersionCheckFailure)
+}
+
+func isAllowedCoordinatorSessionVersionDowngrade(current, session semver.Version) bool {
+	// Permit the verified 3.0.x -> 2.6.x rollback path while keeping other
+	// major/minor downgrades behind the session-version fence.
+	return current.Major == 2 && current.Minor == 6 &&
+		session.Major == 3 && session.Minor == 0
+}
+
+func isLowerMajorMinorVersion(current, session semver.Version) bool {
+	return current.Major < session.Major || (current.Major == session.Major && current.Minor < session.Minor)
 }
 
 // EnableEmbededQueryNodeLabel set server labels for embedded query node.
@@ -377,8 +394,14 @@ func (s *Session) checkVersionForCoordinator() (*mvccpb.KeyValue, error) {
 	if err != nil {
 		return nil, err
 	}
-	if common.Version.Major < version.Major || (common.Version.Major == version.Major && common.Version.Minor < version.Minor) {
-		return nil, errors.Wrapf(errSessionVersionCheckFailure, "current version(%s), session version(%s)", common.Version.String(), version.String())
+	if isLowerMajorMinorVersion(common.Version, version) {
+		if !isAllowedCoordinatorSessionVersionDowngrade(common.Version, version) {
+			return nil, errors.Wrapf(errSessionVersionCheckFailure, "current version(%s), session version(%s)", common.Version.String(), version.String())
+		}
+		s.Logger().Warn("allow coordinator session version downgrade",
+			zap.String("currentVersion", common.Version.String()),
+			zap.String("sessionVersion", version.String()),
+		)
 	}
 	return resp.Kvs[0], nil
 }
@@ -522,7 +545,7 @@ func (s *Session) registerService() error {
 			return err
 		}
 		if txnResp != nil && !txnResp.Succeeded {
-			return fmt.Errorf("function CompareAndSwap error for compare is false for key: %s", s.ServerName)
+			return merr.WrapErrServiceUnavailableMsg("CompareAndSwap failed for session key %s: compare is false", s.ServerName)
 		}
 		if !s.enableActiveStandBy {
 			s.registeredRevision.Store(txnResp.Header.GetRevision())
@@ -616,7 +639,7 @@ func (s *Session) processKeepAliveResponse() {
 			newCH, err := s.etcdCli.KeepAlive(s.ctx, *s.LeaseID)
 			if err != nil {
 				s.Logger().Error("failed to keep alive with etcd", zap.Error(err))
-				lastErr = errors.Wrap(err, "failed to keep alive")
+				lastErr = merr.Wrap(err, "failed to keep alive")
 				continue
 			}
 			s.Logger().Info("keep alive...", zap.Int64("leaseID", int64(*s.LeaseID)))
@@ -638,7 +661,6 @@ func (s *Session) processKeepAliveResponse() {
 
 // checkKeepaliveTTL checks the TTL of the lease and returns the error if the lease is not found or expired.
 func (s *Session) checkKeepaliveTTL(nextKeepaliveInstant time.Time) error {
-	errSessionExpiredAtClientSide := errors.New("session expired at client side")
 	ctx, cancel := context.WithDeadlineCause(s.ctx, nextKeepaliveInstant, errSessionExpiredAtClientSide)
 	defer cancel()
 
@@ -654,7 +676,7 @@ func (s *Session) checkKeepaliveTTL(nextKeepaliveInstant time.Time) error {
 			log.Cleanup()
 			os.Exit(exitCodeSessionLeaseExpired)
 		}
-		return errors.Wrap(err, "failed to check TTL")
+		return merr.Wrap(err, "failed to check TTL")
 	}
 	if ttlResp.TTL <= 0 {
 		s.Logger().Error("confirm the lease is expired, the session is expired without activing closing", zap.Error(err))
@@ -728,11 +750,11 @@ func (s *Session) GetSessionsWithVersionRange(prefix string, r semver.Range) (ma
 
 func (s *Session) GoingStop() error {
 	if s == nil || s.etcdCli == nil || s.LeaseID == nil {
-		return errors.New("the session hasn't been init")
+		return merr.WrapErrServiceInternalMsg("the session hasn't been init")
 	}
 
 	if s.Disconnected() {
-		return errors.New("this session has disconnected")
+		return merr.WrapErrServiceUnavailable("this session has disconnected")
 	}
 
 	completeKey := s.getCompleteKey()

@@ -349,7 +349,7 @@ func (s *Server) startExternalGrpc(errChan chan error) {
 		}
 		if !certPool.AppendCertsFromPEM(rootBuf) {
 			log.Warn("fail to append ca to cert")
-			errChan <- errors.New("fail to append ca to cert")
+			errChan <- merr.WrapErrParameterInvalidMsg("fail to append ca to cert")
 			return
 		}
 
@@ -1031,6 +1031,10 @@ func (s *Server) ListCredUsers(ctx context.Context, req *milvuspb.ListCredUsersR
 
 func (s *Server) CreateRole(ctx context.Context, req *milvuspb.CreateRoleRequest) (*commonpb.Status, error) {
 	return s.proxy.CreateRole(ctx, req)
+}
+
+func (s *Server) AlterRole(ctx context.Context, req *milvuspb.AlterRoleRequest) (*commonpb.Status, error) {
+	return s.proxy.AlterRole(ctx, req)
 }
 
 func (s *Server) DropRole(ctx context.Context, req *milvuspb.DropRoleRequest) (*commonpb.Status, error) {

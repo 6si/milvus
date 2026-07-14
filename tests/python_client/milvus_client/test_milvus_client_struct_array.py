@@ -3399,8 +3399,8 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
     @pytest.mark.tags(CaseLabel.L2)
     def test_struct_with_unsupported_vector_field(self):
         """
-        target: test creating struct with BinaryVector field (should fail)
-        method: attempt to create struct with BinaryVector field
+        target: test creating struct with SparseFloatVector field (should fail)
+        method: attempt to create struct with SparseFloatVector field
         expected: creation should fail
         """
         collection_name = cf.gen_unique_str(f"{prefix}_invalid")
@@ -3413,7 +3413,7 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         schema.add_field(field_name="normal_vector", datatype=DataType.FLOAT_VECTOR, dim=default_dim)
 
         struct_schema = client.create_struct_field_schema()
-        struct_schema.add_field("binary_vector_field", DataType.BINARY_VECTOR, dim=default_dim)
+        struct_schema.add_field("sparse_vector_field", DataType.SPARSE_FLOAT_VECTOR)
         schema.add_field(
             "struct_array",
             datatype=DataType.ARRAY,
@@ -3423,7 +3423,7 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         )
         error = {
             ct.err_code: 65535,
-            ct.err_msg: "now only float vector is supported",
+            ct.err_msg: "only fixed dimension vector types are supported",
         }
         self.create_collection(
             client,
@@ -3671,22 +3671,11 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         )
 
     @pytest.mark.tags(CaseLabel.L2)
-    @pytest.mark.parametrize(
-        "vector_type",
-        [
-            DataType.BINARY_VECTOR,
-            DataType.FLOAT16_VECTOR,
-            DataType.BFLOAT16_VECTOR,
-            DataType.SPARSE_FLOAT_VECTOR,
-            DataType.INT8_VECTOR,
-        ],
-    )
-    def test_struct_array_with_unsupported_vector_types(self, vector_type):
+    def test_struct_array_with_unsupported_vector_types(self):
         """
-        target: test creating struct array with unsupported vector types (non-FLOAT_VECTOR)
-        method: attempt to create struct array with BINARY_VECTOR, FLOAT16_VECTOR,
-                BFLOAT16_VECTOR, SPARSE_FLOAT_VECTOR, INT8_VECTOR vector types
-        expected: creation should fail as only FLOAT_VECTOR is supported in struct array
+        target: test creating struct array with unsupported vector types
+        method: attempt to create struct array with SPARSE_FLOAT_VECTOR
+        expected: creation should fail as only fixed dimension vector types are supported
         """
         collection_name = cf.gen_unique_str(f"{prefix}_invalid")
 
@@ -3699,16 +3688,7 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
 
         # Try to create struct with unsupported vector type
         struct_schema = client.create_struct_field_schema()
-
-        # SPARSE_FLOAT_VECTOR doesn't need dim parameter
-        if vector_type == DataType.SPARSE_FLOAT_VECTOR:
-            struct_schema.add_field("unsupported_vector", vector_type)
-        else:
-            # BINARY_VECTOR needs dim to be multiple of 8
-            if vector_type == DataType.BINARY_VECTOR:
-                struct_schema.add_field("unsupported_vector", vector_type, dim=128)
-            else:
-                struct_schema.add_field("unsupported_vector", vector_type, dim=default_dim)
+        struct_schema.add_field("unsupported_vector", DataType.SPARSE_FLOAT_VECTOR)
 
         schema.add_field(
             "struct_array",
@@ -3718,8 +3698,8 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
             max_capacity=100,
         )
 
-        # Should fail - only FLOAT_VECTOR is supported in struct array
-        error = {ct.err_code: 65535, ct.err_msg: "now only float vector is supported"}
+        # Should fail - sparse vectors are not supported in struct array
+        error = {ct.err_code: 65535, ct.err_msg: "only fixed dimension vector types are supported"}
         self.create_collection(
             client,
             collection_name,
@@ -3895,8 +3875,8 @@ class TestMilvusClientStructArrayInvalid(TestMilvusClientV2Base):
         # Step 2: Perform range search with selected radius and range_filter
         # For COSINE: radius < distance <= range_filter
         error = {
-            ct.err_code: 65535,
-            ct.err_msg: "range search is not supported for vector array",
+            ct.err_code: 1100,
+            ct.err_msg: "range search is not supported for vector array fields",
         }
         self.search(
             client,
@@ -3932,9 +3912,9 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
 
     def gen_file_with_local_bulk_writer(
         self, schema, data: list[dict[str, Any]], file_type: str = "PARQUET"
-    ) -> tuple[str, dict]:
+    ) -> tuple[list[list[str]], dict]:
         """
-        Generate import file using LocalBulkWriter from insert-format data
+        Generate import files using LocalBulkWriter from insert-format data
 
         Args:
             schema: Collection schema
@@ -3942,7 +3922,7 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
             file_type: Output file type, "PARQUET" or "JSON"
 
         Returns:
-            Tuple of (directory path containing generated files, original data dict for verification)
+            Tuple of (LocalBulkWriter batch files, original data dict for verification)
         """
         # Convert file_type string to BulkFileType enum
         bulk_file_type = BulkFileType.PARQUET if file_type == "PARQUET" else BulkFileType.JSON
@@ -4000,9 +3980,12 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
             if not minio_client.bucket_exists(self.bucket_name):
                 raise Exception(f"MinIO bucket '{self.bucket_name}' doesn't exist")
 
-            # Upload file
+            # Upload file. LocalBulkWriter uses deterministic file names such as 1.parquet/1.json
+            # inside a unique UUID directory, so keep the directory name in remote object path to
+            # avoid overwriting files from concurrent or previous runs.
             filename = os.path.basename(local_file_path)
-            minio_file_path = os.path.join(self.REMOTE_DATA_PATH, filename)
+            parent_dir = os.path.basename(os.path.dirname(local_file_path))
+            minio_file_path = os.path.join(self.REMOTE_DATA_PATH, parent_dir, filename)
             minio_client.fput_object(self.bucket_name, minio_file_path, local_file_path)
 
             log.info(f"Uploaded file to MinIO: {minio_file_path}")
@@ -4026,6 +4009,7 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
             url=url,
             collection_name=collection_name,
             files=batch_files,
+            api_key=cf.param_info.param_token,
         )
 
         job_id = resp.json()["data"]["jobId"]
@@ -4037,7 +4021,7 @@ class TestMilvusClientStructArrayImport(TestMilvusClientV2Base):
         while time.time() - start_time < timeout:
             time.sleep(5)
 
-            resp = get_import_progress(url=url, job_id=job_id)
+            resp = get_import_progress(url=url, job_id=job_id, api_key=cf.param_info.param_token)
             state = resp.json()["data"]["state"]
             progress = resp.json()["data"]["progress"]
 

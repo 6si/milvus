@@ -902,7 +902,7 @@ func TestQueryObjectJsonExpr(t *testing.T) {
 		{expr: fmt.Sprintf("%s['interface'][6]['double'][3] == 1.7976931348623157e+308", common.DefaultJSONFieldName), count: common.DefaultNb},
 		{expr: fmt.Sprintf("%s['interface'][7]['bool'][0] == true", common.DefaultJSONFieldName), count: common.DefaultNb},
 		{expr: fmt.Sprintf("%s['interface'][7]['bool'][1] == false", common.DefaultJSONFieldName), count: common.DefaultNb},
-		{expr: fmt.Sprintf("array_length(%s['interface'][0]['empty_array']) == 0", common.DefaultJSONFieldName), count: common.DefaultNb},
+		{expr: fmt.Sprintf("array_length(%s['interface'][8]['empty_array']) == 0", common.DefaultJSONFieldName), count: common.DefaultNb},
 
 		// language
 		{expr: fmt.Sprintf("%s['language'][0]['中文'] == '月亮'", common.DefaultJSONFieldName), count: common.DefaultNb},
@@ -1219,7 +1219,7 @@ func TestRunAnalyzer(t *testing.T) {
 
 	// run analyzer with invalid params
 	_, err = mc.RunAnalyzer(ctx, client.NewRunAnalyzerOption("text doc").WithAnalyzerParamsStr("invalid params}"))
-	common.CheckErr(t, err, false, "json error")
+	common.CheckErr(t, err, false, "JsonError")
 
 	// run analyzer with custom analyzer
 	tokens, err = mc.RunAnalyzer(ctx, client.NewRunAnalyzerOption("test doc").

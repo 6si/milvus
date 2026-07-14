@@ -56,6 +56,7 @@ func (e *StreamingError) IsSkippedOperation() bool {
 // Stop resuming retry and report to user.
 func (e *StreamingError) IsUnrecoverable() bool {
 	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_UNRECOVERABLE ||
+		e.IsInvalidArgument() ||
 		e.IsReplicateViolation() ||
 		e.IsTxnUnavilable()
 }
@@ -84,6 +85,11 @@ func (e *StreamingError) IsTxnExpired() bool {
 // IsResourceAcquired returns true if the resource is acquired.
 func (e *StreamingError) IsResourceAcquired() bool {
 	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_RESOURCE_ACQUIRED
+}
+
+// IsInvalidArgument returns true if the error is caused by invalid argument.
+func (e *StreamingError) IsInvalidArgument() bool {
+	return e.Code == streamingpb.StreamingCode_STREAMING_CODE_INVAILD_ARGUMENT
 }
 
 // IsOnShutdown returns true if the error is caused by on shutdown.
@@ -131,8 +137,9 @@ func NewInner(format string, args ...interface{}) *StreamingError {
 	return New(streamingpb.StreamingCode_STREAMING_CODE_INNER, format, args...)
 }
 
-// NewInvaildArgument creates a new StreamingError with code STREAMING_CODE_INVAILD_ARGUMENT.
-func NewInvaildArgument(format string, args ...interface{}) *StreamingError {
+// NewInvalidArgument creates a new StreamingError with code STREAMING_CODE_INVAILD_ARGUMENT.
+// (The proto enum still carries the historical typo INVAILD; only the Go factory uses the correct spelling.)
+func NewInvalidArgument(format string, args ...interface{}) *StreamingError {
 	return New(streamingpb.StreamingCode_STREAMING_CODE_INVAILD_ARGUMENT, format, args...)
 }
 
