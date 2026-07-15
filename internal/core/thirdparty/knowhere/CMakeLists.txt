@@ -15,8 +15,9 @@
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
 # Pinned to 6si/knowhere branch cagra-nrs (upstream 2.6 / v2.6.17 + cuVS CAGRA
-# num_random_samplings search param + int8 COSINE normalization fixes)
-set( KNOWHERE_VERSION 6f429fc7c46500dde857000bc8c0a9e741bd79a1 )
+# num_random_samplings search param + int8 COSINE normalization, score rescale,
+# and negative IP/COSINE distance clamp fixes)
+set( KNOWHERE_VERSION 95381bce93ae97f325d14e8b4546e8ebb3ce3c47 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
