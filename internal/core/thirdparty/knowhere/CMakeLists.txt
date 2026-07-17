@@ -17,7 +17,7 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # Pinned to an immutable commit SHA on 6si/knowhere@gpu-hnsw-faiss rather than the
 # branch name: a branch is mutable and the build could change with no milvus PR.
 # Repoint to a tagged 6si/knowhere release before merging to production.
-set( KNOWHERE_VERSION fcdcacf21f53c1f1fa7f6afab30a68bdfbf92738 )
+set( KNOWHERE_VERSION d022e89825c499d43822c90041ebb9d4908b6a25 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
