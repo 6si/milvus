@@ -109,6 +109,23 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 		EFConstruction: strconv.Itoa(200),
 		Metric:         metric.COSINE,
 	}
+	// Non-power-of-two 2*M (M=24 => 2*M=48 => staging padded to 64 <= 1024).
+	// Must be accepted: the search kernel pads staging to a power of two.
+	p9 := map[string]string{
+		DIM:            strconv.Itoa(128),
+		HNSWM:          strconv.Itoa(24),
+		EFConstruction: strconv.Itoa(200),
+		Metric:         metric.COSINE,
+	}
+	// M so large the padded layer-0 staging next_pow2(2*M) exceeds the max GPU
+	// block size even at search_width=1 (M=600 => next_pow2(1200)=2048 > 1024).
+	// In range [1, 2048] but unsearchable on GPU, so must be rejected.
+	p10 := map[string]string{
+		DIM:            strconv.Itoa(128),
+		HNSWM:          strconv.Itoa(600),
+		EFConstruction: strconv.Itoa(200),
+		Metric:         metric.COSINE,
+	}
 
 	cases := []struct {
 		params   map[string]string
@@ -126,7 +143,9 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 		{p5, false}, // JACCARD not supported for float vectors
 		{p6, false}, // SUBSTRUCTURE not supported
 		{p7, false}, // SUPERSTRUCTURE not supported
-		{p8, true},  // 384-d COSINE
+		{p8, true},   // 384-d COSINE
+		{p9, true},   // non-power-of-two 2*M (staging padded)
+		{p10, false}, // M too large: padded staging exceeds GPU block size
 	}
 
 	c := requireGpuHnswChecker(t)
