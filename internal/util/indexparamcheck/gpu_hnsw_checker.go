@@ -2,6 +2,7 @@ package indexparamcheck
 
 import (
 	"github.com/milvus-io/milvus-proto/go-api/v3/schemapb"
+	"github.com/milvus-io/milvus/pkg/v3/util/merr"
 )
 
 // gpuHnswMaxStagingCapacity is the largest per-block bitonic-merge staging
@@ -20,6 +21,10 @@ const gpuHnswMaxStagingCapacity = 1024
 // CPU HNSW max (HNSWMaxM=2048); we advertise and enforce the honest GPU bound.
 const gpuHnswMaxM = gpuHnswMaxStagingCapacity / 2
 
+// gpuHnswMinM is the smallest usable HNSW graph degree (a graph needs at least
+// 2 neighbors per node); matches the CPU HNSW advertised minimum.
+const gpuHnswMinM = 2
+
 // gpuHnswChecker validates GPU_HNSW index parameters.
 // knowhere's ValidateIndexParams returns 0 for GPU_HNSW (unimplemented config
 // validation), so we validate M and efConstruction in Go. M and efConstruction
@@ -35,21 +40,29 @@ func (c *gpuHnswChecker) CheckTrain(dataType schemapb.DataType, elementType sche
 	}
 	if _, ok := params[EFConstruction]; ok {
 		if !CheckIntByRange(params, EFConstruction, HNSWMinEfConstruction, HNSWMaxEfConstruction) {
-			return errOutOfRange(params[EFConstruction], HNSWMinEfConstruction, HNSWMaxEfConstruction)
+			return errParamShouldBeInRange(EFConstruction, params[EFConstruction], HNSWMinEfConstruction, HNSWMaxEfConstruction)
 		}
 	}
 	if _, ok := params[HNSWM]; ok {
 		// Enforce the GPU-specific max (gpuHnswMaxM=512): M > 512 stages more
 		// than a single CUDA block can hold, so such an index can never be
 		// searched on the GPU even though it would build.
-		if !CheckIntByRange(params, HNSWM, HNSWMinM, gpuHnswMaxM) {
-			return errOutOfRange(params[HNSWM], HNSWMinM, gpuHnswMaxM)
+		if !CheckIntByRange(params, HNSWM, gpuHnswMinM, gpuHnswMaxM) {
+			return errParamShouldBeInRange(HNSWM, params[HNSWM], gpuHnswMinM, gpuHnswMaxM)
 		}
 	}
 	if !CheckIntByRange(params, DIM, 1, 1<<31-1) {
-		return errOutOfRange(params[DIM], 1, 1<<31-1)
+		return errParamShouldBeInRange(DIM, params[DIM], 1, 1<<31-1)
 	}
 	return nil
+}
+
+// errParamShouldBeInRange mirrors the "param '<key>' (<value>) should be in
+// range [<min>, <max>]" wording knowhere emits for CPU HNSW, so GPU_HNSW
+// surfaces a consistent create-time message (knowhere's config validation is a
+// no-op for GPU_HNSW, so this Go checker is the authoritative validator).
+func errParamShouldBeInRange(key, value string, min, max int) error {
+	return merr.WrapErrParameterInvalidMsg("param '%s' (%s) should be in range [%d, %d]", key, value, min, max)
 }
 
 func newGpuHnswChecker() IndexChecker {

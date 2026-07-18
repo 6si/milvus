@@ -54,7 +54,7 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 	invalidEfParamsMax[EFConstruction] = strconv.Itoa(HNSWMaxEfConstruction + 1)
 
 	invalidMParamsMin := copyParams(validParams)
-	invalidMParamsMin[HNSWM] = strconv.Itoa(HNSWMinM - 1)
+	invalidMParamsMin[HNSWM] = strconv.Itoa(gpuHnswMinM - 1)
 
 	invalidMParamsMax := copyParams(validParams)
 	invalidMParamsMax[HNSWM] = strconv.Itoa(gpuHnswMaxM + 1)
