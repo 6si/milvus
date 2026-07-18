@@ -21,7 +21,6 @@
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -38,7 +37,6 @@
 #include "common/OpContext.h"
 #include "common/QueryInfo.h"
 #include "common/QueryResult.h"
-#include "common/ScopedTimer.h"
 #include "common/Tracer.h"
 #include "common/Types.h"
 #include "common/Utils.h"
@@ -54,14 +52,11 @@
 #include "futures/Future.h"
 #include "glog/logging.h"
 #include "index/Meta.h"
-#include "index/json_stats/JsonKeyStats.h"
 #include "log/Log.h"
 #include "milvus-storage/filesystem/fs.h"
-#include "monitor/Monitor.h"
 #include "monitor/scope_metric.h"
 #include "nlohmann/json.hpp"
 #include "opentelemetry/trace/span.h"
-#include "pb/index_cgo_msg.pb.h"
 #include "pb/schema.pb.h"
 #include "pb/segcore.pb.h"
 #include "prometheus/histogram.h"
@@ -77,7 +72,6 @@
 #include "segcore/SegmentSealed.h"
 #include "segcore/Types.h"
 #include "storage/FileManager.h"
-#include "storage/RemoteChunkManagerSingleton.h"
 #include "storage/ThreadPools.h"
 #include "storage/Types.h"
 #include "storage/loon_ffi/property_singleton.h"
@@ -371,6 +365,50 @@ GetSearchResultValidCount(CSearchResult search_result) {
     return res->valid_count_;
 }
 
+// Verifies the plan's external field references against the loaded manifest,
+// after LazyCheckSchema refreshed the segment schema and manifest view.
+// Optionally ignores fields that the current execution path will not access.
+void
+CheckExternalFieldsInLoadedManifest(
+    const milvus::SchemaPtr& schema,
+    milvus::segcore::SegmentInternalInterface* segment,
+    const std::vector<milvus::FieldId>& fields,
+    const std::vector<milvus::FieldId>& skipped_fields = {}) {
+    if (!schema || !schema->is_external_collection()) {
+        return;
+    }
+
+    for (auto field_id : fields) {
+        if (std::find(skipped_fields.begin(), skipped_fields.end(), field_id) !=
+            skipped_fields.end()) {
+            continue;
+        }
+        if (!schema->has_field(field_id)) {
+            continue;
+        }
+
+        if (!schema->IsExternalManifestStoredField(field_id)) {
+            continue;
+        }
+        const auto& field_meta = schema->operator[](field_id);
+        auto column_name = schema->GetPhysicalColumnName(field_id);
+        // External output may be served through take(), so "ready" here means
+        // the loaded manifest contains the storage column. It intentionally
+        // does not require field data or index accessibility.
+        if (!segment->HasColumnInLoadedManifest(column_name)) {
+            throw milvus::SegcoreError(
+                milvus::FieldNotLoaded,
+                fmt::format(
+                    "external field \"{}\" (storage column \"{}\") is not "
+                    "available in the current loaded external collection "
+                    "manifest; run RefreshExternalCollection and reload the "
+                    "collection before accessing this field",
+                    field_meta.get_name().get(),
+                    column_name));
+        }
+    }
+}
+
 //////////////////////////////    public C API wrappers    //////////////////////////////
 
 CFuture*  // Future<milvus::SearchResult*>
@@ -420,6 +458,17 @@ AsyncSearch(CTraceContext c_trace,
             auto internal_segment =
                 static_cast<milvus::segcore::SegmentInternalInterface*>(
                     segment);
+            std::vector<milvus::FieldId> skipped_manifest_fields;
+            if (filter_only) {
+                skipped_manifest_fields.push_back(target_vector_field_id);
+                for (auto field_id : plan->target_entries_) {
+                    skipped_manifest_fields.push_back(field_id);
+                }
+            }
+            CheckExternalFieldsInLoadedManifest(plan->schema_,
+                                                internal_segment,
+                                                plan->access_entries_,
+                                                skipped_manifest_fields);
             std::unique_ptr<milvus::SearchResult> search_result;
             if (!filter_only &&
                 !internal_segment->FieldAccessible(target_vector_field_id)) {
@@ -513,6 +562,11 @@ AsyncRetrieve(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            auto internal_segment =
+                static_cast<milvus::segcore::SegmentInternalInterface*>(
+                    segment);
+            CheckExternalFieldsInLoadedManifest(
+                plan->schema_, internal_segment, plan->access_entries_);
 
             auto retrieve_result =
                 segment->Retrieve(&trace_ctx,
@@ -553,6 +607,11 @@ AsyncRetrieveByOffsets(CTraceContext c_trace,
 
             milvus::OpContext op_ctx(cancel_token);
             segment->LazyCheckSchema(plan->schema_, &op_ctx);
+            auto internal_segment =
+                static_cast<milvus::segcore::SegmentInternalInterface*>(
+                    segment);
+            CheckExternalFieldsInLoadedManifest(
+                plan->schema_, internal_segment, plan->access_entries_);
 
             auto retrieve_result =
                 segment->Retrieve(&trace_ctx, plan, offsets, len, cancel_token);
@@ -723,152 +782,6 @@ LoadDeletedRecord(CSegmentInterface c_segment,
                                                pks.get(),
                                                deleted_record_info.row_count};
         segment_interface->LoadDeletedRecord(load_info);
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
-    }
-}
-
-CStatus
-UpdateSealedSegmentIndex(CSegmentInterface c_segment,
-                         CLoadIndexInfo c_load_index_info) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        auto segment =
-            dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
-        AssertInfo(segment != nullptr, "segment conversion failed");
-        auto load_index_info =
-            static_cast<milvus::segcore::LoadIndexInfo*>(c_load_index_info);
-        segment->LoadIndex(*load_index_info);
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
-    }
-}
-
-CStatus
-LoadJsonKeyIndex(CTraceContext c_trace,
-                 CSegmentInterface c_segment,
-                 const uint8_t* serialized_load_json_key_index_info,
-                 const uint64_t len,
-                 CLoadCancellationSource source) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto ctx = milvus::tracer::TraceContext{
-            c_trace.traceID, c_trace.spanID, c_trace.traceFlags};
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        auto segment =
-            dynamic_cast<milvus::segcore::SegmentSealed*>(segment_interface);
-        AssertInfo(segment != nullptr, "segment conversion failed");
-
-        // Check for cancellation before starting
-        if (source) {
-            auto cancellation_source =
-                static_cast<folly::CancellationSource*>(source);
-            if (cancellation_source->getToken().isCancellationRequested()) {
-                throw milvus::SegcoreError(
-                    milvus::ErrorCode::FollyCancel,
-                    fmt::format("Load cancelled for segment {} json stats",
-                                segment->get_segment_id()));
-            }
-        }
-
-        auto info_proto =
-            std::make_unique<milvus::proto::indexcgo::LoadJsonKeyIndexInfo>();
-        info_proto->ParseFromArray(serialized_load_json_key_index_info, len);
-        if (!milvus::JSON_KEY_STATS_ENABLED.load()) {
-            LOG_WARN(
-                "skip load json stats because json key stats is disabled, "
-                "segment:{}, field:{}, build:{}, version:{}",
-                segment->get_segment_id(),
-                info_proto->fieldid(),
-                info_proto->buildid(),
-                info_proto->version());
-            return milvus::SuccessCStatus();
-        }
-
-        milvus::storage::FieldDataMeta field_meta{info_proto->collectionid(),
-                                                  info_proto->partitionid(),
-                                                  segment->get_segment_id(),
-                                                  info_proto->fieldid(),
-                                                  info_proto->schema()};
-        milvus::storage::IndexMeta index_meta{segment->get_segment_id(),
-                                              info_proto->fieldid(),
-                                              info_proto->buildid(),
-                                              info_proto->version()};
-        auto remote_chunk_manager =
-            milvus::storage::RemoteChunkManagerSingleton::GetInstance()
-                .GetRemoteChunkManager();
-        auto fs = milvus::segcore::GetDefaultArrowFileSystem();
-        AssertInfo(fs != nullptr, "arrow file system is null");
-
-        milvus::Config config;
-        std::vector<std::string> files;
-        files.reserve(info_proto->files_size());
-        for (const auto& f : info_proto->files()) {
-            files.push_back(f);
-        }
-        config[milvus::index::INDEX_FILES] = files;
-        config[milvus::LOAD_PRIORITY] = info_proto->load_priority();
-        config[milvus::index::ENABLE_MMAP] = info_proto->enable_mmap();
-        if (info_proto->enable_mmap()) {
-            config[milvus::index::MMAP_FILE_PATH] = info_proto->mmap_dir_path();
-        }
-        if (info_proto->warmup_policy() != "") {
-            config[milvus::index::WARMUP] = info_proto->warmup_policy();
-        }
-        config[milvus::index::INDEX_SIZE] = info_proto->stats_size();
-        if (!info_proto->base_path().empty()) {
-            config[STATS_BASE_PATH_KEY] = info_proto->base_path();
-        }
-
-        milvus::storage::FileManagerContext file_ctx(
-            field_meta, index_meta, remote_chunk_manager, fs);
-
-        auto index =
-            std::make_shared<milvus::index::JsonKeyStats>(file_ctx, true);
-        {
-            milvus::ScopedTimer timer(
-                "json_stats_load",
-                [](double us) {
-                    milvus::monitor::internal_json_stats_latency_load.Observe(
-                        us / 1000.0);
-                },
-                milvus::ScopedTimer::LogLevel::Info);
-            index->Load(ctx, config);
-        }
-
-        segment->LoadJsonStats(milvus::FieldId(info_proto->fieldid()),
-                               std::move(index));
-
-        LOG_INFO("load json stats success for field:{} of segment:{}",
-                 info_proto->fieldid(),
-                 segment->get_segment_id());
-
-        return milvus::SuccessCStatus();
-    } catch (std::exception& e) {
-        return milvus::FailureCStatus(&e);
-    }
-}
-
-CStatus
-UpdateFieldRawDataSize(CSegmentInterface c_segment,
-                       int64_t field_id,
-                       int64_t num_rows,
-                       int64_t field_data_size) {
-    SCOPE_CGO_CALL_METRIC();
-
-    try {
-        auto segment_interface =
-            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
-        AssertInfo(segment_interface != nullptr, "segment conversion failed");
-        segment_interface->set_field_avg_size(
-            milvus::FieldId(field_id), num_rows, field_data_size);
         return milvus::SuccessCStatus();
     } catch (std::exception& e) {
         return milvus::FailureCStatus(&e);
@@ -1790,6 +1703,51 @@ BuildArrayForChunk(const FieldInfo& field_info,
 }  // anonymous namespace
 
 CStatus
+GetGrowingSegmentMaterializedFieldIDs(CSegmentInterface c_segment,
+                                      int64_t** field_ids,
+                                      int64_t* count) {
+    SCOPE_CGO_CALL_METRIC();
+
+    try {
+        if (!c_segment || !field_ids || !count) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "invalid arguments: segment, field_ids and count must not be "
+                "null");
+        }
+        *field_ids = nullptr;
+        *count = 0;
+        auto segment_interface =
+            reinterpret_cast<milvus::segcore::SegmentInterface*>(c_segment);
+        auto growing_segment =
+            dynamic_cast<milvus::segcore::SegmentGrowingImpl*>(
+                segment_interface);
+        if (!growing_segment) {
+            return milvus::FailureCStatus(milvus::UnexpectedError,
+                                          "segment is not a growing segment");
+        }
+        auto ids = growing_segment->get_insert_record().get_data_field_ids();
+        if (!ids.empty()) {
+            auto* buf =
+                static_cast<int64_t*>(malloc(sizeof(int64_t) * ids.size()));
+            if (!buf) {
+                return milvus::FailureCStatus(
+                    milvus::UnexpectedError,
+                    "failed to allocate materialized field ids");
+            }
+            for (size_t i = 0; i < ids.size(); i++) {
+                buf[i] = ids[i];
+            }
+            *field_ids = buf;
+            *count = static_cast<int64_t>(ids.size());
+        }
+        return milvus::SuccessCStatus();
+    } catch (std::exception& e) {
+        return milvus::FailureCStatus(&e);
+    }
+}
+
+CStatus
 FlushGrowingSegmentData(CSegmentInterface c_segment,
                         int64_t start_offset,
                         int64_t end_offset,
@@ -1812,6 +1770,8 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         result->field_ids = nullptr;
         result->field_null_counts = nullptr;
         result->num_field_stats = 0;
+        result->flushed_field_ids = nullptr;
+        result->num_flushed_fields = 0;
         result->column_group_ids = nullptr;
         result->column_group_memory_sizes = nullptr;
         result->num_column_groups = 0;
@@ -1896,6 +1856,10 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         // to ensure deterministic column order matching the reader's expected order.
         std::vector<FieldInfo> field_infos;
         std::vector<std::shared_ptr<arrow::Field>> arrow_fields;
+        // Columns legally skipped below (dropped fields, non-materialized
+        // function outputs); the column-group accounting loop must tolerate
+        // their absence as well.
+        std::unordered_set<int64_t> skipped_columns;
 
         for (const auto& field_id : schema.get_field_ids()) {
             if (!allowed_field_ids.empty() &&
@@ -1913,6 +1877,46 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
             } else if (field_id == TimestampFieldID) {
                 vec_base = &insert_record.timestamps_;
             } else {
+                // HasFieldData, not is_data_exist: a column the ctor
+                // allocated but replayed older-era inserts never filled is
+                // not materialized either.
+                if (!growing_segment->HasFieldData(field_id)) {
+                    // Legally absent: the field is gone from the segment's
+                    // own schema (dropped; the flush schema is a staler
+                    // snapshot), or it is a function output the segment
+                    // never materializes (backfilled by bump-schema
+                    // compaction). The Go layer normally trims such columns
+                    // from the layout already — this is the defense for
+                    // stale layouts.
+                    if (!growing_segment->get_schema().has_field(field_id)) {
+                        LOG_INFO(
+                            "skip dropped field {} when flushing growing "
+                            "segment {}",
+                            field_id.get(),
+                            growing_segment->get_segment_id());
+                        skipped_columns.insert(field_id.get());
+                        continue;
+                    }
+                    if (schema.is_function_output(field_id)) {
+                        LOG_INFO(
+                            "skip non-materialized function output field {} "
+                            "when flushing growing segment {}",
+                            field_id.get(),
+                            growing_segment->get_segment_id());
+                        skipped_columns.insert(field_id.get());
+                        continue;
+                    }
+                    // A regular field of the segment's own schema is
+                    // materialized by the ctor/Reopen by construction;
+                    // reaching here is real data loss.
+                    return milvus::FailureCStatus(
+                        milvus::UnexpectedError,
+                        fmt::format("field {} has no field data in growing "
+                                    "segment {} but is present in the "
+                                    "segment schema",
+                                    field_id.get(),
+                                    growing_segment->get_segment_id()));
+                }
                 vec_base = insert_record.get_data_base(field_id);
                 if (!vec_base) {
                     LOG_ERROR("no data base for field {} of segment {}",
@@ -2001,6 +2005,20 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
         if (field_infos.empty()) {
             return milvus::FailureCStatus(milvus::UnexpectedError,
                                           "no fields to flush");
+        }
+
+        // Publish the authoritative flushed-column set directly from
+        // field_infos; Go binlog meta must be derived from this.
+        result->flushed_field_ids =
+            static_cast<int64_t*>(malloc(sizeof(int64_t) * field_infos.size()));
+        if (!result->flushed_field_ids) {
+            return milvus::FailureCStatus(
+                milvus::UnexpectedError,
+                "failed to allocate flushed field ids");
+        }
+        result->num_flushed_fields = field_infos.size();
+        for (size_t i = 0; i < field_infos.size(); i++) {
+            result->flushed_field_ids[i] = field_infos[i].field_id.get();
         }
 
         auto arrow_schema = arrow::schema(arrow_fields);
@@ -2238,6 +2256,11 @@ FlushGrowingSegmentData(CSegmentInterface c_segment,
                 for (size_t j = 0; j < field_count; j++) {
                     auto field_id =
                         config->column_group_field_ids[field_offset + j];
+                    if (skipped_columns.count(field_id) > 0) {
+                        // Column intentionally not flushed; contributes no
+                        // size and must not fail the accounting.
+                        continue;
+                    }
                     auto size_it = field_uncompressed_sizes.find(field_id);
                     if (size_it == field_uncompressed_sizes.end()) {
                         return milvus::FailureCStatus(
@@ -2416,6 +2439,10 @@ FreeFlushResult(CFlushResult* result) {
     if (result && result->field_null_counts) {
         free(result->field_null_counts);
         result->field_null_counts = nullptr;
+    }
+    if (result && result->flushed_field_ids) {
+        free(result->flushed_field_ids);
+        result->flushed_field_ids = nullptr;
     }
     if (result && result->column_group_ids) {
         free(result->column_group_ids);

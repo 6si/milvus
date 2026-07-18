@@ -56,6 +56,10 @@ func (s fakeGrowingFlushSource) CurrentOffset() int64 {
 	return 10
 }
 
+func (s fakeGrowingFlushSource) MaterializedFieldIDs(ctx context.Context) ([]int64, error) {
+	return []int64{0, 1, 100, 101, 102}, nil
+}
+
 func (s fakeGrowingFlushSource) FlushGrowingData(ctx context.Context, startOffset, endOffset int64, config *syncmgr.GrowingFlushConfig) (*syncmgr.GrowingFlushResult, error) {
 	if s.flushFunc != nil {
 		return s.flushFunc(ctx, startOffset, endOffset, config)
@@ -100,6 +104,10 @@ type fakeGrowingSourceReleaseHandoffProvider struct {
 	fakeGrowingSourceProvider
 	fenceTs  uint64
 	segments []syncmgr.GrowingSourceReleaseHandoffSegment
+}
+
+func (p *fakeGrowingSourceReleaseHandoffProvider) BeginGrowingSourceReleaseHandoff(segmentIDs []int64) func() {
+	return func() {}
 }
 
 func (p *fakeGrowingSourceReleaseHandoffProvider) PrepareGrowingSourceReleaseHandoff(ctx context.Context, fenceTs uint64, segments []syncmgr.GrowingSourceReleaseHandoffSegment) error {
@@ -176,7 +184,7 @@ func (s *L0WriteBufferSuite) SetupSuite() {
 }
 
 func (s *L0WriteBufferSuite) composeInsertMsg(segmentID int64, rowCount int, dim int, pkType schemapb.DataType) ([]int64, *msgstream.InsertMsg) {
-	tss := lo.RepeatBy(rowCount, func(idx int) int64 { return int64(tsoutil.ComposeTSByTime(time.Now(), int64(idx))) })
+	tss := lo.RepeatBy(rowCount, func(idx int) int64 { return int64(tsoutil.ComposeTSByTimeWithLogical(time.Now(), int64(idx))) })
 	vectors := lo.RepeatBy(rowCount, func(_ int) []float32 {
 		return lo.RepeatBy(dim, func(_ int) float32 { return rand.Float32() })
 	})
@@ -296,7 +304,7 @@ func (s *L0WriteBufferSuite) composeDeleteMsg(pks []storage.PrimaryKey) *msgstre
 	delMsg := &msgstream.DeleteMsg{
 		DeleteRequest: &msgpb.DeleteRequest{
 			PrimaryKeys: storage.ParsePrimaryKeys2IDs(pks),
-			Timestamps:  lo.RepeatBy(len(pks), func(idx int) uint64 { return tsoutil.ComposeTSByTime(time.Now(), int64(idx)+1) }),
+			Timestamps:  lo.RepeatBy(len(pks), func(idx int) uint64 { return tsoutil.ComposeTSByTimeWithLogical(time.Now(), int64(idx)+1) }),
 		},
 	}
 	return delMsg
@@ -308,7 +316,7 @@ func (s *L0WriteBufferSuite) SetupTest() {
 	s.metacache.EXPECT().GetSchema(mock.Anything).Return(s.collSchema).Maybe()
 	s.metacache.EXPECT().Collection().Return(s.collID).Maybe()
 	s.allocator = allocator.NewMockGIDAllocator()
-	s.allocator.AllocOneF = func() (int64, error) { return int64(tsoutil.ComposeTSByTime(time.Now(), 0)), nil }
+	s.allocator.AllocOneF = func() (int64, error) { return int64(tsoutil.ComposeTSByTime(time.Now())), nil }
 }
 
 func (s *L0WriteBufferSuite) newTextMetaCache(schema *schemapb.CollectionSchema) *metacache.MockMetaCache {
@@ -1594,6 +1602,47 @@ func (s *L0WriteBufferSuite) TestGetGrowingFlushProgress() {
 		s.Equal(metacache.FlushSourceUnknown, progress[0].SourceMode)
 		s.Zero(handoffProvider.fenceTs)
 		s.Empty(handoffProvider.segments)
+	})
+
+	s.Run("requested_segments_are_merged_with_tracked_growing_progress", func() {
+		handoffProvider := &fakeGrowingSourceReleaseHandoffProvider{}
+		registration := syncmgr.DefaultGrowingSourceRegistry().Register(s.channelName, handoffProvider)
+		defer syncmgr.DefaultGrowingSourceRegistry().Unregister(registration)
+
+		textSchema := s.textSchema()
+		mc := s.newTextRealMetaCache(textSchema)
+		wb, err := NewL0WriteBuffer(s.channelName, mc, s.syncMgr, &writeBufferOption{
+			idAllocator: s.allocator,
+			growingSourceResolver: func(segmentID int64, targetOffset int64, _ *msgpb.MsgPosition) (syncmgr.GrowingFlushSource, syncmgr.GrowingSourceState) {
+				return fakeGrowingFlushSource{}, syncmgr.GrowingSourceUsable
+			},
+		})
+		s.NoError(err)
+
+		for _, segmentID := range []int64{1205, 1206} {
+			_, msg := s.composeTextInsertMsg(segmentID, 10)
+			insertData, err := PrepareInsert(textSchema, s.pkSchema, []*msgstream.InsertMsg{msg})
+			s.NoError(err)
+			err = wb.BufferData(insertData, nil, &msgpb.MsgPosition{Timestamp: 100}, &msgpb.MsgPosition{Timestamp: 200}, 100)
+			s.NoError(err)
+		}
+
+		progress, err := wb.GetGrowingFlushProgress(context.Background(), []int64{1204}, 200)
+		s.NoError(err)
+		progressBySegment := lo.SliceToMap(progress, func(progress GrowingFlushSegmentProgress) (int64, GrowingFlushSegmentProgress) {
+			return progress.SegmentID, progress
+		})
+		s.Contains(progressBySegment, int64(1204))
+		s.False(progressBySegment[1204].NeedReleaseHandoff)
+		for _, segmentID := range []int64{1205, 1206} {
+			s.True(progressBySegment[segmentID].NeedReleaseHandoff)
+			s.EqualValues(10, progressBySegment[segmentID].TargetOffset)
+			s.Equal(metacache.FlushSourceGrowing, progressBySegment[segmentID].SourceMode)
+		}
+		s.ElementsMatch([]syncmgr.GrowingSourceReleaseHandoffSegment{
+			{SegmentID: 1205, TargetOffset: 10},
+			{SegmentID: 1206, TargetOffset: 10},
+		}, handoffProvider.segments)
 	})
 }
 

@@ -1244,6 +1244,9 @@ func (h *HandlersV2) query(ctx context.Context, c *gin.Context, anyReq any, dbNa
 	if httpReq.Limit > 0 && !matchCountRule(httpReq.OutputFields) {
 		req.QueryParams = append(req.QueryParams, &commonpb.KeyValuePair{Key: proxy.LimitKey, Value: strconv.FormatInt(int64(httpReq.Limit), 10)})
 	}
+	if len(httpReq.OrderByFields) > 0 {
+		req.QueryParams = append(req.QueryParams, &commonpb.KeyValuePair{Key: proxy.OrderByFieldsKey, Value: strings.Join(httpReq.OrderByFields, ",")})
+	}
 	resp, err := wrapperProxyWithLimit(ctx, c, req, h.checkAuth, false, "/milvus.proto.milvus.MilvusService/Query", true, h.proxy, func(reqCtx context.Context, req any) (interface{}, error) {
 		return h.proxy.Query(reqCtx, req.(*milvuspb.QueryRequest))
 	})
@@ -2059,10 +2062,22 @@ func defaultMetricTypeForQuickCreate(dataType schemapb.DataType) string {
 	}
 }
 
+func binaryMetricTypesForQuickCreate() []string {
+	binaryIndexType := paramtable.Get().AutoIndexConfig.BinaryIndexParams.GetAsJSONMap()[common.IndexTypeKey]
+	switch binaryIndexType {
+	case "BIN_FLAT":
+		return indexparamcheck.BinIDMapMetrics
+	case "BIN_IVF_FLAT", "":
+		return indexparamcheck.BinIvfMetrics
+	default:
+		return indexparamcheck.BinIvfMetrics
+	}
+}
+
 func validateMetricTypeForQuickCreate(dataType schemapb.DataType, metricType string) error {
 	switch dataType {
 	case schemapb.DataType_BinaryVector:
-		if !funcutil.SliceContain(indexparamcheck.BinaryVectorMetrics, metricType) {
+		if !funcutil.SliceContain(binaryMetricTypesForQuickCreate(), metricType) {
 			return merr.WrapErrParameterInvalid("valid index params", "invalid index params", "binary vector index does not support metric type: "+metricType)
 		}
 	case schemapb.DataType_SparseFloatVector:

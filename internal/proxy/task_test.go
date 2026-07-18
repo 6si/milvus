@@ -45,6 +45,7 @@ import (
 	"github.com/milvus-io/milvus/internal/proxy/shardclient"
 	"github.com/milvus-io/milvus/internal/querycoordv2/meta"
 	"github.com/milvus-io/milvus/internal/util/function/embedding"
+	"github.com/milvus-io/milvus/internal/util/indexparamcheck"
 	"github.com/milvus-io/milvus/pkg/v3/common"
 	"github.com/milvus-io/milvus/pkg/v3/mq/msgstream"
 	"github.com/milvus-io/milvus/pkg/v3/proto/indexpb"
@@ -3538,18 +3539,20 @@ func Test_createIndexTask_getIndexedFieldAndFunction(t *testing.T) {
 }
 
 func Test_fillDimension(t *testing.T) {
+	// fillDimension moved to indexparamcheck.FillDimension (shared with the
+	// add-function-field bound-index path); coverage kept here for the proxy flow.
 	t.Run("scalar", func(t *testing.T) {
 		f := &schemapb.FieldSchema{
 			DataType: schemapb.DataType_Int64,
 		}
-		assert.NoError(t, fillDimension(f, nil))
+		assert.NoError(t, indexparamcheck.FillDimension(f, nil))
 	})
 
 	t.Run("no dim in schema", func(t *testing.T) {
 		f := &schemapb.FieldSchema{
 			DataType: schemapb.DataType_FloatVector,
 		}
-		assert.Error(t, fillDimension(f, nil))
+		assert.Error(t, indexparamcheck.FillDimension(f, nil))
 	})
 
 	t.Run("dimension mismatch", func(t *testing.T) {
@@ -3562,7 +3565,7 @@ func Test_fillDimension(t *testing.T) {
 				},
 			},
 		}
-		assert.Error(t, fillDimension(f, map[string]string{common.DimKey: "8"}))
+		assert.Error(t, indexparamcheck.FillDimension(f, map[string]string{common.DimKey: "8"}))
 	})
 
 	t.Run("normal", func(t *testing.T) {
@@ -3576,7 +3579,7 @@ func Test_fillDimension(t *testing.T) {
 			},
 		}
 		m := map[string]string{}
-		assert.NoError(t, fillDimension(f, m))
+		assert.NoError(t, indexparamcheck.FillDimension(f, m))
 		assert.Equal(t, "128", m[common.DimKey])
 	})
 }
@@ -6309,6 +6312,43 @@ func TestAlterCollectionField(t *testing.T) {
 				ElementType: schemapb.DataType_Int64,
 				TypeParams:  []*commonpb.KeyValuePair{{Key: "max_capacity", Value: "100"}},
 			},
+			{
+				FieldID:  102,
+				Name:     "text_match_field",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.MaxLengthKey, Value: "100"},
+					{Key: "enable_match", Value: "true"},
+					{Key: common.EnableAnalyzerKey, Value: "true"},
+					{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+				},
+			},
+			{
+				FieldID:  103,
+				Name:     "bm25_input_field",
+				DataType: schemapb.DataType_VarChar,
+				TypeParams: []*commonpb.KeyValuePair{
+					{Key: common.MaxLengthKey, Value: "100"},
+					{Key: common.EnableAnalyzerKey, Value: "true"},
+					{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+				},
+			},
+			{
+				FieldID:          104,
+				Name:             "bm25_output_field",
+				DataType:         schemapb.DataType_SparseFloatVector,
+				IsFunctionOutput: true,
+			},
+		},
+		Functions: []*schemapb.FunctionSchema{
+			{
+				Name:             "bm25_func",
+				Type:             schemapb.FunctionType_BM25,
+				InputFieldIds:    []int64{103},
+				InputFieldNames:  []string{"bm25_input_field"},
+				OutputFieldIds:   []int64{104},
+				OutputFieldNames: []string{"bm25_output_field"},
+			},
 		},
 	}
 	schemaBytes, err := proto.Marshal(schema)
@@ -6373,6 +6413,60 @@ func TestAlterCollectionField(t *testing.T) {
 				{Key: common.MmapEnabledKey, Value: "true"},
 			},
 			expectError: false,
+		},
+		{
+			name:      "update analyzer params on inactive string field",
+			fieldName: "string_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.EnableAnalyzerKey, Value: "true"},
+				{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+			},
+			expectError: false,
+		},
+		{
+			name:      "update analyzer params without enable analyzer",
+			fieldName: "string_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+			},
+			expectError: false,
+		},
+		{
+			name:      "reject analyzer params on non-string field",
+			fieldName: "array_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.EnableAnalyzerKey, Value: "true"},
+				{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"standard"}`},
+			},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
+		},
+		{
+			name:      "invalid enable analyzer value",
+			fieldName: "string_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.EnableAnalyzerKey, Value: "not_bool"},
+			},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
+		},
+		{
+			name:      "reject analyzer params on text match field",
+			fieldName: "text_match_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"whitespace"}`},
+			},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
+		},
+		{
+			name:      "reject analyzer params on bm25 input field",
+			fieldName: "bm25_input_field",
+			properties: []*commonpb.KeyValuePair{
+				{Key: common.AnalyzerParamKey, Value: `{"tokenizer":"whitespace"}`},
+			},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
 		},
 		{
 			name:      "invalid property key",
@@ -6457,6 +6551,33 @@ func TestAlterCollectionField(t *testing.T) {
 			fieldName:   "string_field",
 			deleteKeys:  []string{MmapEnabledKey},
 			expectError: false,
+		},
+		{
+			name:        "delete analyzer params on inactive string field",
+			fieldName:   "string_field",
+			deleteKeys:  []string{common.EnableAnalyzerKey, common.AnalyzerParamKey},
+			expectError: false,
+		},
+		{
+			name:        "reject delete analyzer params on non-string field",
+			fieldName:   "array_field",
+			deleteKeys:  []string{common.EnableAnalyzerKey, common.AnalyzerParamKey},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
+		},
+		{
+			name:        "reject delete analyzer params on text match field",
+			fieldName:   "text_match_field",
+			deleteKeys:  []string{common.AnalyzerParamKey},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
+		},
+		{
+			name:        "reject delete analyzer params on bm25 input field",
+			fieldName:   "bm25_input_field",
+			deleteKeys:  []string{common.AnalyzerParamKey},
+			expectError: true,
+			errCode:     merr.Code(merr.ErrParameterInvalid),
 		},
 		{
 			name:        "delete max_length is not allowed",
@@ -7599,6 +7720,13 @@ func TestValidateAddFieldRequest(t *testing.T) {
 }
 
 func TestAlterCollectionSchemaTask(t *testing.T) {
+	// Add-function cases require StorageV3 + schema-bump/storage-version compaction enabled
+	// (validateAddFunctionRequiresStorageV3). storageVersion.enabled defaults true;
+	// bumpSchemaVersion.enabled defaults false, so it must be set explicitly.
+	paramtable.Get().Save(paramtable.Get().CommonCfg.UseLoonFFI.Key, "true")
+	paramtable.Get().Save(paramtable.Get().DataCoordCfg.BumpSchemaVersionCompactionEnabled.Key, "true")
+	defer paramtable.Get().Reset(paramtable.Get().CommonCfg.UseLoonFFI.Key)
+	defer paramtable.Get().Reset(paramtable.Get().DataCoordCfg.BumpSchemaVersionCompactionEnabled.Key)
 	rc := NewMixCoordMock()
 	ctx := context.Background()
 	prefix := "TestAlterCollectionSchemaTask"
@@ -7680,7 +7808,13 @@ func TestAlterCollectionSchemaTask(t *testing.T) {
 				Op: &milvuspb.AlterCollectionSchemaRequest_Action_AddRequest{
 					AddRequest: &milvuspb.AlterCollectionSchemaRequest_AddRequest{
 						FieldInfos: []*milvuspb.AlterCollectionSchemaRequest_FieldInfo{
-							{FieldSchema: proto.Clone(sparseOutputField).(*schemapb.FieldSchema)},
+							{
+								FieldSchema: proto.Clone(sparseOutputField).(*schemapb.FieldSchema),
+								ExtraParams: []*commonpb.KeyValuePair{
+									{Key: common.IndexTypeKey, Value: "SPARSE_INVERTED_INDEX"},
+									{Key: common.MetricTypeKey, Value: "BM25"},
+								},
+							},
 						},
 						FuncSchema: []*schemapb.FunctionSchema{proto.Clone(functionSchema).(*schemapb.FunctionSchema)},
 					},
@@ -7988,6 +8122,10 @@ func TestAlterCollectionSchemaTask(t *testing.T) {
 				{Key: common.DimKey, Value: "4096"},
 			},
 		}
+		addRequest.FieldInfos[0].ExtraParams = []*commonpb.KeyValuePair{
+			{Key: common.IndexTypeKey, Value: "MINHASH_LSH"},
+			{Key: common.MetricTypeKey, Value: "MHJACCARD"},
+		}
 		functionSchema := proto.Clone(addRequest.GetFuncSchema()[0]).(*schemapb.FunctionSchema)
 		functionSchema.Name = "minhash_func"
 		functionSchema.Type = schemapb.FunctionType_MinHash
@@ -8060,6 +8198,28 @@ func TestAlterCollectionSchemaTask(t *testing.T) {
 		task := buildTask(buildValidRequest(), oldSchema)
 		err := task.PreExecute(ctx)
 		assert.NoError(t, err)
+	})
+
+	t.Run("PreExecute rejects invalid bound index name", func(t *testing.T) {
+		req := buildValidRequest()
+		req.GetAction().GetAddRequest().GetFieldInfos()[0].IndexName = "1bad-index-name"
+		task := buildTask(req, oldSchema)
+		err := task.PreExecute(ctx)
+		assert.Error(t, err)
+		assert.ErrorIs(t, err, merr.ErrParameterInvalid)
+		assert.ErrorContains(t, err, "Invalid index name")
+	})
+
+	t.Run("PreExecute keeps the user's original index params in the request", func(t *testing.T) {
+		req := buildValidRequest()
+		original := proto.Clone(req.GetAction().GetAddRequest().GetFieldInfos()[0]).(*milvuspb.AlterCollectionSchemaRequest_FieldInfo)
+		task := buildTask(req, oldSchema)
+		err := task.PreExecute(ctx)
+		assert.NoError(t, err)
+		// Validation-only: no normalization write-back, so the persisted
+		// UserIndexParams stay aligned with the create_index convention and a
+		// later create_index with identical params remains idempotent.
+		assert.True(t, proto.Equal(original, req.GetAction().GetAddRequest().GetFieldInfos()[0]))
 	})
 
 	t.Run("Execute leaves function output marker to RootCoord", func(t *testing.T) {

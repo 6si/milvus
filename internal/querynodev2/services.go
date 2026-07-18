@@ -67,6 +67,12 @@ import (
 	"github.com/milvus-io/milvus/pkg/v3/util/typeutil"
 )
 
+// legacyLoadScopeIndex is the retired wire value emitted by QueryCoord
+// versions that predate LoadScope_Reopen. Keep the value out of the proto enum
+// so it cannot be reused, while recognizing it here to return a precise
+// mixed-version protocol error.
+const legacyLoadScopeIndex = querypb.LoadScope(2)
+
 type segmentDetacher interface {
 	DetachStreaming(ctx context.Context, segmentID typeutil.UniqueID) int
 }
@@ -552,12 +558,21 @@ func (node *QueryNode) LoadSegments(ctx context.Context, req *querypb.LoadSegmen
 	switch req.GetLoadScope() {
 	case querypb.LoadScope_Delta:
 		return node.loadDeltaLogs(ctx, req), nil
-	case querypb.LoadScope_Index:
-		return node.loadIndex(ctx, req), nil
 	case querypb.LoadScope_Stats:
 		return node.reopenSegments(ctx, req), nil
 	case querypb.LoadScope_Reopen:
 		return node.reopenSegments(ctx, req), nil
+	case querypb.LoadScope_Full:
+		// Continue with the full segment load below.
+	case legacyLoadScopeIndex:
+		err := merr.WrapErrServiceInternalMsg(
+			"legacy segment index load scope %d is no longer supported; upgrade QueryCoord to use LoadScope_Reopen before routing requests to this QueryNode",
+			req.GetLoadScope())
+		return merr.Status(err), nil
+	default:
+		err := merr.WrapErrServiceInternalMsg(
+			"unsupported segment load scope %d", req.GetLoadScope())
+		return merr.Status(err), nil
 	}
 
 	// Actual load segment
@@ -717,9 +732,6 @@ func (node *QueryNode) prepareReleaseManualFlush(ctx context.Context, collection
 	segmentIDs = lo.Uniq(lo.Filter(segmentIDs, func(segmentID int64, _ int) bool {
 		return segmentID > 0 && !syncmgr.DefaultGrowingSourceRegistry().IsReleasePrepared(channel, segmentID, 0)
 	}))
-	if len(segmentIDs) == 0 {
-		return false, nil
-	}
 	wal := streaming.WAL()
 	if wal == nil {
 		return false, merr.WrapErrServiceUnavailable("streaming WAL is not initialized")
@@ -732,6 +744,7 @@ func isReleaseManualFlushPrepareUnavailable(err error) bool {
 		return false
 	}
 	if errors.Is(err, merr.ErrServiceUnavailable) ||
+		errors.Is(err, merr.ErrChannelNotAvailable) ||
 		errors.Is(err, handler.ErrClientClosed) ||
 		errors.Is(err, registry.ErrNoStreamingNodeDeployed) ||
 		errors.Is(err, registry.ErrNoReleaseManualFlushPreparer) {

@@ -309,6 +309,10 @@ message AlterCollectionMessageUpdates {
     common.ConsistencyLevel consistency_level = 6; // consistency level should be updated.
     repeated common.KeyValuePair properties   = 7; // collection properties should be updated.
     AlterLoadConfigOfAlterCollection alter_load_config = 8; // alter load config of alter collection.
+    // Index meta bound to newly added function-output/vector fields.
+    // Fully materialized (index id/name allocated, params validated) at DDL prepare
+    // stage BEFORE broadcast; applied atomically with the schema in the ack callback.
+    repeated index.FieldIndex bound_field_indexes = 9;
 }
 
 // AlterLoadConfigOfAlterCollection is the body of alter load config of alter collection message.
@@ -792,6 +796,18 @@ message CipherHeader {
     int64 collection_id = 2; // related to the collection id
     bytes safe_key = 3; // the safe key
     int64 payload_bytes = 4; // the size of the payload before encryption
+}
+
+// TraceContextHeader carries the trace context subset (trace_id, span_id,
+// flags) stored on a message. Tracestate is intentionally not persisted.
+// Serialized into Properties under reserved key `_tc` so that consumers on
+// the other side of an RPC / persistence boundary can stitch spans into the
+// correct parent-child tree.
+// See docs/agent_guides/streaming-system/wal/tracing.md for details.
+message TraceContextHeader {
+    bytes  trace_id = 1;  // 16 bytes
+    bytes  span_id  = 2;  // 8 bytes
+    uint32 flags    = 3;  // W3C TraceFlags (sampled bit)
 }
 
 // TruncateCollectionMessageHeader is the header of truncate collection message.
