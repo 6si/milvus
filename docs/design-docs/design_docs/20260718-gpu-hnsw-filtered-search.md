@@ -9,13 +9,22 @@
   [20260711-gpu-hnsw-ocq-removal.md](20260711-gpu-hnsw-ocq-removal.md)
 - **Released:** N/A
 
-> **Revision 2 (2026-07-18)** — incorporates design-review feedback. Resolved:
-> **I1** concrete two-tier smem layout (`ef_valid = ef` unchanged, validity packed
-> into `is_expanded`, separate `ef_inv` frontier, recomputed `max_ef` at the real
-> 24 B/slot base — §5.3/§5.5); **I2** device-side `needs_bf[]` short-query
-> fallback (no mid-search host round-trip — §5.4); **I3** batch-level alpha gate
-> in the post-sort serial section (§5.3). Minor items M1–M6 folded into §5.2/§5.4/
-> §7.
+> **Revision 2 (2026-07-18)** — incorporates first-round design-review feedback.
+> Resolved: **I1** concrete two-tier smem layout (`ef_valid = ef` unchanged,
+> validity packed into `is_expanded`, separate `ef_inv` frontier); **I2**
+> device-side `needs_bf[]` short-query fallback (no mid-search host round-trip —
+> §5.4); **I3** batch-level alpha gate in the post-sort serial section (§5.3).
+> Minor items M1–M6 folded into §5.2/§5.4/§7.
+>
+> **Revision 3 (2026-07-18)** — second review round. **N1** cross-beam merge /
+> eviction / parent-selection decision tree spelled out (§5.3.1). Added
+> `needs_bf_count` and `accumulated_alpha` init details (§5.4). **Rejected** the
+> "12 B/slot" smem correction: the code has **six** `ef`-length arrays
+> (`result_*` + `merged_*`, `GpuHnswSearchKernel.cuh:480-490,669-680`) and a
+> `/24` divisor (`GpuHnswSearch.cuh:172-173`); the merge is **not** in-place
+> (`merged_*` written at `:408-417`, copied back at `:421-425`). Base stays
+> 24 B/ef ⇒ with the +12 B invalid frontier, `max_ef ≈ (smem−overhead)/36`
+> (§5.5).
 
 ## 1. Summary
 
@@ -210,6 +219,43 @@ Mirror §3.1–3.2 inside `layer0_beam_search_kernel`:
   (`<float>`, `<half>`, `<__nv_bfloat16>`, `<int8,float>`, `<int8,int8,DP4A>`).
   The filter is dtype-independent (operates on ids).
 
+#### 5.3.1 Cross-beam merge, eviction, and parent selection (resolves N1)
+Today `parallel_merge_into_result` merges the distance-sorted staging list into a
+**single** beam and `is_expanded` drives parent selection from that one beam
+(`meta[2]`). With two tiers this must become explicit. Concrete decision tree,
+applied while consuming the sorted staging list (single-threaded alpha-gate
+section, then the parallel merge):
+
+1. **Per candidate (in distance order):**
+   - `is_filtered(id) == false` → merge into the **result beam** exactly as today
+     (binary-search insert into `result_ids/result_dists`, mark `is_expanded=0`,
+     validity-bit=valid). Standard `ef`-capacity eviction (worst tail drops).
+   - `is_filtered(id) == true` → apply the alpha gate (§5.3). If admitted, insert
+     into the **invalid frontier** (`invalid_ids/invalid_dists`) **iff** its
+     distance `< result_dists[meta[0]-1]` (the valid beam's current worst) — the
+     GPU analog of `NeighborSetDoublePopList::insert`'s
+     `nbr.distance < valid_ns_->at_search_back_dist()` guard. Frontier eviction:
+     `ef_inv`-capacity, worst-distance tail drops (a filtered node only matters
+     as a *near* waypoint).
+2. **Parent selection each iteration (the `pop_based_on_distance` analog).** Build
+   the next `search_width` parents by selecting the globally-closest **unexpanded**
+   nodes across **both** beams:
+   - track an unexpanded cursor for each beam (result via the existing
+     `is_expanded` flags; frontier via its own `invalid_exp` flags);
+   - repeatedly take the smaller-distance head of the two cursors until
+     `search_width` parents are chosen or both are exhausted;
+   - mark each chosen node expanded in its own beam.
+   Filtered parents expand their neighbors (preserving connectivity) but never
+   contribute to the top-k copy-out. This mirrors CPU `has_next()` continuing
+   while `invalid_ns_` has a candidate closer than the valid beam's back.
+3. **Termination.** Stop when no unexpanded node in either beam is closer than the
+   valid beam's worst (matches CPU's `has_next()`), or `max_iterations` is hit.
+
+This cross-beam selection is the most intricate part of the kernel and must be
+covered by the racecheck run and the recall gate (§9). If it proves too costly at
+large `ef_inv`, the graceful degrade is the BF path (§5.4), never a silent recall
+drop.
+
 ### 5.4 Brute-force fallback kernel (§3.3 parity)
 Add a device brute-force top-k over live rows (a distance kernel that skips
 `is_filtered` ids + a top-k selection). GPU BF is embarrassingly parallel and
@@ -236,23 +282,41 @@ to the graph path and to CPU.
     few queries are short; up-front-only with a lower threshold would run BF on
     whole batches that don't need it. The device-append variant pays BF cost
     only for the queries that actually came up short.
+  - *`needs_bf_count` init:* zeroed by a `cudaMemsetAsync` on the slot stream
+    before the graph launch (chained by stream order); the graph kernel
+    `atomicAdd`s into it. Cheap (4 bytes) and keeps the count device-resident.
+  - *`accumulated_alpha` init:* stored per query in `meta[]` and initialized to
+    **`1.0f`** at kernel start (matching CPU's `workspace.accumulated_alpha = 1.0f`
+    for the non-BF branch; the BF branch is handled up-front, so the kernel never
+    needs the CPU `FLT_MAX` always-admit init).
 - **`disable_fallback_brute_force` (M5).** Threaded as a `bool` in
   `GpuHnswSearchParams`, read by knowhere `Search()` from the same config key
   the CPU path uses; when set, the short-query fallback launch is skipped and
   short queries return padded sentinels (matching CPU).
 
 ### 5.5 Shared-memory budget (concrete, resolves I1/§5.5)
-Current per-`ef` cost is **24 B/slot** — six `ef`-length arrays
-(`result_ids/result_dists/is_expanded` + `merged_ids/merged_dists/merged_expanded`),
-so `max_ef = (smem_max − smem_overhead) / 24` (`GpuHnswSearchKernel.cuh:665`,
-`GpuHnswSearch.cuh` fit check). The reviewer's "12 B/slot" undercounts (it omits
-the three merge arrays); the real base is 24 B.
+The current per-`ef` cost is **24 B/slot — six `ef`-length arrays**, verified
+against source (not 12 B):
+- The smem pointer layout allocates **three result arrays and three merge
+  arrays**, each length `ef`: `result_ids/result_dists/is_expanded`
+  (`GpuHnswSearchKernel.cuh:480-482`) **and**
+  `merged_ids/merged_dists/merged_expanded` (`GpuHnswSearchKernel.cuh:488-490`).
+- `calc_layer0_smem_size` sums all six (`GpuHnswSearchKernel.cuh:669-680`).
+- The fit check divisor is explicit: `int max_ef = (smem_max − smem_overhead) / 24;`
+  with the comment *"3 result arrays + 3 merge arrays = 6 × 4 = 24 bytes/slot"*
+  (`GpuHnswSearch.cuh:172-173`).
+- The merge is **not** in-place: `parallel_merge_into_result` writes candidates
+  into the `merged_*` arrays (`:408-417`) then copies them back into `result_*`
+  (`:421-425`). The `merged_*` arrays are what make the base 24 B, not 12 B.
+  (The `/12` and "no merged arrays" reading cites `GpuHnswSearch.cuh:130`, which
+  is the `block_size` default, not the `max_ef` calc at `:173`.)
 
 Because validity is packed into `is_expanded` (no new result-beam array), the
 result beam stays **24 B/ef**. The invalid frontier adds **12 B/ef_inv**
-(`invalid_ids/invalid_dists/invalid_exp`). With `ef_inv = ef` the new fit becomes:
+(`invalid_ids/invalid_dists/invalid_exp` — a frontier, not a merge target, so no
+`merged_*` twin). With `ef_inv = ef` the new fit becomes:
 ```
-max_ef ≈ (smem_max − smem_overhead) / 36        # 24 (result) + 12 (invalid)
+max_ef ≈ (smem_max − smem_overhead) / 36        # 24 (result+merge) + 12 (invalid)
 ```
 On an L40S (opt-in smem ≈ 100 KB; `cudaDevAttrMaxSharedMemoryPerBlockOptin`) with
 ~2 KB overhead this is `max_ef ≈ 2,720`; on the default 48 KB budget it is
