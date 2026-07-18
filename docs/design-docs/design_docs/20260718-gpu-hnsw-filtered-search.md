@@ -9,6 +9,14 @@
   [20260711-gpu-hnsw-ocq-removal.md](20260711-gpu-hnsw-ocq-removal.md)
 - **Released:** N/A
 
+> **Revision 2 (2026-07-18)** — incorporates design-review feedback. Resolved:
+> **I1** concrete two-tier smem layout (`ef_valid = ef` unchanged, validity packed
+> into `is_expanded`, separate `ef_inv` frontier, recomputed `max_ef` at the real
+> 24 B/slot base — §5.3/§5.5); **I2** device-side `needs_bf[]` short-query
+> fallback (no mid-search host round-trip — §5.4); **I3** batch-level alpha gate
+> in the post-sort serial section (§5.3). Minor items M1–M6 folded into §5.2/§5.4/
+> §7.
+
 ## 1. Summary
 
 Today `GPU_HNSW` / `GPU_HNSW_SQ` **rejects** any search that carries a non-empty
@@ -143,25 +151,56 @@ used for GPU_HNSW.)
   stream before launch, and passes `d_bitset` (nullable ⇒ no filter), `N`, and
   the precomputed `filter_ratio` / `kAlpha` into `GpuHnswSearchParams`.
 - VRAM cost: N=1M ⇒ 125 KB × pool_size(4) = 500 KB per segment. Negligible.
+- **Stream ordering + lifetime (M2).** The upload and the kernel launch are on
+  the **same** slot stream, so stream ordering guarantees the copy completes
+  before the kernel reads `d_bitset` — no explicit sync needed. `Search()` is
+  synchronous (it blocks on results), so Milvus's `BitsetView` host memory stays
+  valid for the whole call. **Invariant to preserve:** if `Search()` is ever made
+  async, the host bitset must be copied into pinned scratch first, or its
+  lifetime extended — called out here so the invariant is not silently broken.
+- **Reallocation on N change (M3).** `d_bitset` has the same N-dependency as the
+  existing `d_visited_bitmaps`; `ensure()` tracks `bitset_bytes` alongside
+  `bitmap_bytes` and reallocates when a pooled slot is reused for a segment with
+  a different `N` (identical pattern to the visited bitmap).
 
 ### 5.3 Kernel: two-tier beam + alpha gate (`GpuHnswSearchKernel.cuh`)
 Mirror §3.1–3.2 inside `layer0_beam_search_kernel`:
 - **Device bitset test:** `__device__ bool is_filtered(const uint8_t* b, uint32_t id)`
   (word/bit test; `b==nullptr ⇒ false`).
-- **Split the beam.** Today one `ef` beam doubles as result+frontier via
-  `is_expanded`. Add a per-slot `status` (valid/invalid) so:
-  - valid (non-filtered) candidates occupy the **result** portion that feeds
-    the top-k copy-out;
-  - invalid (filtered) candidates are retained for **expansion only**, kept only
-    while their distance beats the valid beam's worst — the GPU analog of
-    `invalid_ns_` gated by `valid_ns_->at_search_back_dist()`.
-  This touches `parallel_merge_into_result` / `bitonic_sort_staging`
-  bookkeeping and the shared-memory layout (extra status array), so it needs a
-  fresh smem-budget calc (§5.5) and racecheck run.
-- **Alpha gate.** Carry `accumulated_alpha` as a per-block (per-query) scalar in
-  shared memory; when a discovered neighbor is filtered, apply the exact
-  `+= kAlpha; if (<1) skip; else -= 1` logic before admitting it to the invalid
-  frontier. `kAlpha` is passed in from the host (`filter_ratio * 0.7`).
+- **Two-tier beam — concrete smem layout (resolves I1).** The result beam is
+  **not** split or shrunk: `ef_valid = ef` (the caller's `ef`), so at 0% filter
+  the result beam is byte-for-byte today's beam and recall cannot regress. The
+  invalid frontier is a **separate, additional** region of size `ef_inv` (default
+  `ef_inv = ef`, host-tunable/cappable). Validity is encoded as a **flag bit in
+  the existing `is_expanded` word** (currently only 0/1) — **no new per-slot
+  `status` array**, so the result-beam per-slot cost stays 24 B (see below). New
+  smem layout:
+  ```
+  result_ids[ef]  result_dists[ef]  is_expanded[ef]      (24 B/ef — unchanged; validity packed into is_expanded)
+  merged_ids[ef]  merged_dists[ef]  merged_expanded[ef]  (already present)
+  invalid_ids[ef_inv]  invalid_dists[ef_inv]  invalid_exp[ef_inv]   (NEW: 12 B/ef_inv)
+  staging / parent_ids / meta                            (unchanged)
+  ```
+  The invalid frontier is admitted only while its distance beats the valid
+  beam's worst (`result_dists[meta[0]-1]`) — the GPU analog of `invalid_ns_`
+  gated by `valid_ns_->at_search_back_dist()`.
+- **Alpha gate — parallel semantics (resolves I3).** CPU's `accumulated_alpha`
+  is a *sequential rate-limiter* ("admit one filtered node, skip the next
+  ~1/kAlpha"), which has no meaning across parallel warps. We adopt the
+  reviewer's **Option 3 (batch-level, after sort)**: the alpha gate runs in the
+  **already-serial** post-`bitonic_sort_staging` section of
+  `parallel_merge_into_result`, single-threaded, walking the distance-sorted
+  staging list and applying the exact `+= kAlpha; if (<1) skip; else -= 1` logic
+  to each filtered candidate before it may enter the invalid frontier.
+  `accumulated_alpha` is a per-query value carried in `meta[]` across iterations.
+  This is deterministic and preserves the rate-limiting *effect* in distance
+  order; it is **not** bit-identical to CPU graph-neighbor encounter order, so
+  parity is asserted **empirically** by the recall gate (§9), not by identical
+  traversal. `kAlpha = filter_ratio * 0.7` is passed from the host.
+- **`search_width` / staging unchanged (M4).** Staging still holds *all*
+  discovered neighbors (filtered included); `max_staging = search_width *
+  max_degree0` is unaffected. Filtering only changes (a) result admission and
+  (b) the alpha-gated entry into the invalid frontier.
 - **Upper layers unchanged.** `upper_layer_search_kernel` only routes; results
   come from layer 0. Leave greedy descent alone — deleted nodes still route.
 - **Copy-out** (`GpuHnswSearchKernel.cuh:651`): emit only valid ids into the `k`
@@ -174,23 +213,56 @@ Mirror §3.1–3.2 inside `layer0_beam_search_kernel`:
 ### 5.4 Brute-force fallback kernel (§3.3 parity)
 Add a device brute-force top-k over live rows (a distance kernel that skips
 `is_filtered` ids + a top-k selection). GPU BF is embarrassingly parallel and
-fast for a single segment.
+fast for a single segment. It writes to the **same** `d_neighbors` /
+`d_distances` scratch buffers as the graph kernel (M1), using the **same** metric
+helpers (L2 / negated-IP / cosine via `d_inv_norms`) so scores are byte-identical
+to the graph path and to CPU.
 - **Up-front trigger** (host, in knowhere `Search()`): if
-  `filtered >= 0.93*N` or `k >= 0.5*live`, launch BF directly and skip the graph
-  kernel. Matches `kHnswSearchKnnBFFilterThreshold` / `kHnswSearchBFTopkThreshold`.
-- **Per-query trigger:** after the graph kernel, for any query whose valid-result
-  count `< k` while `>= k` live rows exist, relaunch that query on the BF kernel.
-  Matches `bf_search_needed()`. Honor a `disable_fallback_brute_force` equivalent.
-- Distances use the same metric helpers (L2 / negated-IP / cosine via
-  `d_inv_norms`) so scores are identical to the graph path and to CPU.
+  `filtered >= 0.93*N` or `k >= 0.5*live`, launch BF directly and **skip the
+  graph kernel entirely** (so BF and graph never write the same buffer in one
+  call — resolves the M1 buffer-conflict concern). Matches
+  `kHnswSearchKnnBFFilterThreshold` / `kHnswSearchBFTopkThreshold`.
+- **Short-query fallback — device-side, no host round-trip (resolves I2).**
+  The naive per-query design (sync → host reads valid_count → host relaunches
+  selected queries) forces a graph-kernel/BF serial dependency + a mid-search
+  host round-trip. Instead: the graph kernel writes each query's `valid_count`
+  into a small device buffer and **atomically appends** the query index to a
+  `needs_bf[]` list when `valid_count < k` (and `>= k` live rows exist). A
+  **single** batched BF kernel then runs over exactly the appended queries, on
+  the same stream (one extra launch, chained by stream order — no host sync
+  mid-search). If `needs_bf` is empty the launch is a no-op (a 0-grid guard).
+  This keeps the CPU per-query guarantee (R3) without the round-trip.
+  - *Rationale over "BF-all" or "up-front-only":* BF-all wastes work when only a
+    few queries are short; up-front-only with a lower threshold would run BF on
+    whole batches that don't need it. The device-append variant pays BF cost
+    only for the queries that actually came up short.
+- **`disable_fallback_brute_force` (M5).** Threaded as a `bool` in
+  `GpuHnswSearchParams`, read by knowhere `Search()` from the same config key
+  the CPU path uses; when set, the short-query fallback launch is skipped and
+  short queries return padded sentinels (matching CPU).
 
-### 5.5 Shared-memory budget
-Layer-0 smem is already `ef`-bound (`calc_layer0_smem_size`), with a clamp +
-warning when `ef` exceeds the device budget. The extra per-slot `status` array
-(and any beam split) increases per-`ef` cost, lowering the max fittable `ef`.
-Re-derive `max_ef` and update the clamp/warning so heavy-filter searches don't
-silently lose recall or fail to launch. If the split cost is prohibitive at large
-`ef`, degrade gracefully to the BF path rather than clamp below `k`.
+### 5.5 Shared-memory budget (concrete, resolves I1/§5.5)
+Current per-`ef` cost is **24 B/slot** — six `ef`-length arrays
+(`result_ids/result_dists/is_expanded` + `merged_ids/merged_dists/merged_expanded`),
+so `max_ef = (smem_max − smem_overhead) / 24` (`GpuHnswSearchKernel.cuh:665`,
+`GpuHnswSearch.cuh` fit check). The reviewer's "12 B/slot" undercounts (it omits
+the three merge arrays); the real base is 24 B.
+
+Because validity is packed into `is_expanded` (no new result-beam array), the
+result beam stays **24 B/ef**. The invalid frontier adds **12 B/ef_inv**
+(`invalid_ids/invalid_dists/invalid_exp`). With `ef_inv = ef` the new fit becomes:
+```
+max_ef ≈ (smem_max − smem_overhead) / 36        # 24 (result) + 12 (invalid)
+```
+On an L40S (opt-in smem ≈ 100 KB; `cudaDevAttrMaxSharedMemoryPerBlockOptin`) with
+~2 KB overhead this is `max_ef ≈ 2,720`; on the default 48 KB budget it is
+`max_ef ≈ 1,280`. Typical `ef` (200) and every current test config sit far below
+both, so **no existing configuration regresses**. The implementation must print
+the recomputed `max_ef` and keep the existing clamp+warning. If `ef_inv = ef`
+ever pushes a large-`ef`/large-`M` search past the budget, **degrade to the BF
+path** (which needs no per-block beam smem) rather than clamp `ef` below `k`. A
+cap `ef_inv = min(ef, ef_inv_cap)` is available to trade invalid-frontier depth
+for smem headroom without touching the result beam.
 
 ### 5.6 Concurrency (R4)
 `d_bitset` is per scratch-pool slot and **read-only** in the kernel — no new write
@@ -213,11 +285,17 @@ unchanged. Re-run the p1 concurrent-search + reload racecheck with filtering on.
 - `faiss/gpu/impl/GpuHnswSearch.cuh`: bitset upload + BF-vs-graph launch; thread
   params into all specializations.
 - `faiss/gpu/impl/GpuHnswSearchKernel.cuh`: `is_filtered`, two-tier beam, alpha
-  gate, filtered copy-out; new BF kernel.
+  gate, filtered copy-out.
+- **`faiss/gpu/impl/GpuHnswBruteForce.cuh` (NEW file):** the BF top-k kernel +
+  the device `needs_bf[]` append/short-query path (§5.4). Because it is a new
+  file, the vendoring checklist must add it to the knowhere GPU source list
+  (`faiss_gpu_hnsw` target in `cmake/libs/libfaiss.cmake`, the sole GPU
+  compilation path documented in the delta-5 CMake comment block) — it is **not**
+  picked up by the `FAISS_SRCS` glob, which excludes `faiss/gpu/*` (M6).
 - `faiss/gpu/GpuIndexHNSW.{h,cu}`: extend `searchHost` / `searchHostInt8` to
-  accept the bitset + params.
-- Re-vendor the changed GPU files into `knowhere/thirdparty/faiss` byte-identically
-  (`cmp`-verified), as with every prior GPU change.
+  accept the bitset + params (incl. `disable_fallback_brute_force`).
+- Re-vendor the changed/new GPU files into `knowhere/thirdparty/faiss`
+  byte-identically (`cmp`-verified), as with every prior GPU change.
 
 ## 8. Milvus changes (docs/tests only — no logic)
 - Flip the ⚠️ filtered-search callout and the **Failure Modes** row in
