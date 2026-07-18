@@ -27,6 +27,7 @@ import pytest
 from pymilvus import (
     MilvusClient,
     DataType,
+    LoadState,
 )
 
 log = logging.getLogger(__name__)
@@ -41,6 +42,33 @@ EF_SEARCH = 400
 M = 16
 RECALL_THRESHOLD = 0.95
 COLLECTION_PREFIX = "test_gpu_hnsw_e2e_"
+
+
+def wait_load_complete(client, collection_name, timeout=120):
+    """Block until a collection finishes loading, instead of guessing a sleep."""
+    client.wait_for_loading_complete(collection_name, timeout=timeout)
+
+
+def wait_until(predicate, timeout=120, interval=0.5, desc="condition"):
+    """Poll ``predicate`` until it returns truthy or ``timeout`` elapses.
+
+    Replaces fixed ``time.sleep()`` guesses for asynchronous state changes
+    (segment reload, hot-load of a newly sealed segment) with a bounded poll on
+    the actual observable condition, so the test neither races nor over-waits.
+    """
+    deadline = time.time() + timeout
+    last_exc = None
+    while time.time() < deadline:
+        try:
+            if predicate():
+                return
+        except Exception as e:  # noqa: BLE001 — retry transient errors while polling
+            last_exc = e
+        time.sleep(interval)
+    msg = f"timed out after {timeout}s waiting for {desc}"
+    if last_exc is not None:
+        msg += f" (last error: {last_exc})"
+    raise AssertionError(msg)
 
 
 def compute_recall(results, ground_truth, k):
@@ -161,7 +189,7 @@ class TestGpuHnswRecall:
         self.client.load_collection(self.collection_name)
 
         # Wait for collection to be fully loaded
-        time.sleep(2)
+        wait_load_complete(self.client, self.collection_name)
 
         # Search
         results = self.client.search(
@@ -242,7 +270,7 @@ class TestGpuHnswHotLoad:
         )
         self.client.create_index(self.collection_name, index_params)
         self.client.load_collection(self.collection_name)
-        time.sleep(2)
+        wait_load_complete(self.client, self.collection_name)
 
         # Verify initial search works
         query = [initial_vectors[0]]
@@ -264,8 +292,23 @@ class TestGpuHnswHotLoad:
         self.client.insert(self.collection_name, hot_rows)
         self.client.flush(self.collection_name)
 
-        # Wait for new segment to be loaded (sealed + loaded via override path)
-        time.sleep(5)
+        # Wait for the new sealed segment to be loaded via the override path by
+        # polling until the hot-inserted vector self-searches to its own id,
+        # rather than guessing a fixed sleep.
+        hot_query = [hot_vectors[0]]
+        hot_id = initial_count
+
+        def _hot_segment_searchable():
+            r = self.client.search(
+                collection_name=self.collection_name,
+                data=hot_query,
+                anns_field="vector",
+                search_params={"metric_type": "COSINE", "params": {"ef": EF_SEARCH}},
+                limit=1,
+            )
+            return len(r) > 0 and len(r[0]) > 0 and r[0][0]["id"] == hot_id
+
+        wait_until(_hot_segment_searchable, desc="hot-inserted segment to load on GPU")
 
         # Verify hot-inserted vectors are searchable (self-search)
         query = [hot_vectors[0]]
@@ -367,7 +410,7 @@ class TestGpuHnswRestart:
         )
         self.client.create_index(self.collection_name, index_params)
         self.client.load_collection(self.collection_name)
-        time.sleep(2)
+        wait_load_complete(self.client, self.collection_name)
 
         # Search before release — establish baseline
         results_before = self.client.search(
@@ -385,9 +428,13 @@ class TestGpuHnswRestart:
 
         # RELEASE + RELOAD (simulates querynode restart path)
         self.client.release_collection(self.collection_name)
-        time.sleep(1)
+        wait_until(
+            lambda: self.client.get_load_state(self.collection_name)["state"]
+            != LoadState.Loaded,
+            desc="collection to release",
+        )
         self.client.load_collection(self.collection_name)
-        time.sleep(3)  # Wait for segments to reload on GPU
+        wait_load_complete(self.client, self.collection_name)  # segments reload on GPU
 
         # Search after reload — should produce same results
         results_after = self.client.search(
@@ -492,7 +539,7 @@ class TestGpuHnswVramExhaustion:
             name = COLLECTION_PREFIX + f"vram_{idx}_" + str(int(time.time()))
             try:
                 self._create_and_load_collection(name, vectors_per_collection, large_dim)
-                time.sleep(2)
+                wait_load_complete(self.client, name)
 
                 if first_collection is None:
                     first_collection = name
@@ -641,7 +688,8 @@ class TestGpuHnswMixedMode:
         self.client.create_index(self.collection_float, index_params2)
         self.client.load_collection(self.collection_float)
 
-        time.sleep(3)
+        wait_load_complete(self.client, self.collection_int8)
+        wait_load_complete(self.client, self.collection_float)
 
         # --- Verify both collections produce correct search results ---
 
@@ -727,7 +775,8 @@ class TestGpuHnswMixedMode:
         self.client.create_index(self.collection_float, index_params2)
         self.client.load_collection(self.collection_float)
 
-        time.sleep(3)
+        wait_load_complete(self.client, self.collection_int8)
+        wait_load_complete(self.client, self.collection_float)
 
         # Run interleaved searches — verify no cross-contamination
         num_rounds = 10
