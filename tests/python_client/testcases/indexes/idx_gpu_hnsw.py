@@ -31,14 +31,20 @@ class GPU_HNSW:
             "expected": success
         },
         {
+            # Negative M is rejected by knowhere's stock HNSW JSON validator
+            # (range [2, 2048]) before the Go GPU checker runs, so the message
+            # here shows [2, 2048], not the GPU-honest [2, 512] shown for M=513.
+            # Either way M<2 is refused.
             "description": "Out of Range Test - Negative",
             "params": {"M": -1},
-            "expected": {"err_code": 999, "err_msg": "param 'M' (-1) should be in range [2, 512]"}
+            "expected": {"err_code": 1100, "err_msg": "param 'M' (-1) should be in range [2, 2048]"}
         },
         {
+            # 513 is within knowhere's [2, 2048], so it passes the JSON validator
+            # and is caught by the Go GPU checker's honest gpuHnswMaxM=512 bound.
             "description": "Out of Range Test - Too Large",
             "params": {"M": 513},
-            "expected": {"err_code": 999, "err_msg": "param 'M' (513) should be in range [2, 512]"}
+            "expected": {"err_code": 1100, "err_msg": "param 'M' (513) should be in range [2, 512]"}
         },
         {
             "description": "String Type Test will ignore the wrong type",
