@@ -21,8 +21,9 @@ const gpuHnswMaxStagingCapacity = 1024
 // CPU HNSW max (HNSWMaxM=2048); we advertise and enforce the honest GPU bound.
 const gpuHnswMaxM = gpuHnswMaxStagingCapacity / 2
 
-// gpuHnswMinM is the smallest usable HNSW graph degree (a graph needs at least
-// 2 neighbors per node); matches the CPU HNSW advertised minimum.
+// gpuHnswMinM is the smallest usable HNSW graph degree for the GPU kernel (a
+// graph needs at least 2 neighbors per node). This is stricter than the CPU
+// HNSW minimum (HNSWMinM=1); we enforce the honest GPU bound.
 const gpuHnswMinM = 2
 
 // gpuHnswChecker validates GPU_HNSW index parameters.
