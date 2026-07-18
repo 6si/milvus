@@ -22,19 +22,22 @@ class GPU_HNSW_SQ:
             "expected": success
         },
         {
+            # GPU max M is 512 (not the CPU HNSW 2048): the search kernel stages
+            # next_pow2(2*M) candidates in one CUDA block (<=1024 threads), so
+            # M>512 would build but never be GPU-searchable.
             "description": "Maximum Boundary Test",
-            "params": {"M": 2048},
+            "params": {"M": 512},
             "expected": success
         },
         {
             "description": "Out of Range Test - Negative",
             "params": {"M": -1},
-            "expected": {"err_code": 1100, "err_msg": "param 'M' (-1) should be in range [2, 2048]"}
+            "expected": {"err_code": 1100, "err_msg": "param 'M' (-1) should be in range [2, 512]"}
         },
         {
             "description": "Out of Range Test - Too Large",
-            "params": {"M": 2049},
-            "expected": {"err_code": 1100, "err_msg": "param 'M' (2049) should be in range [2, 2048]"}
+            "params": {"M": 513},
+            "expected": {"err_code": 1100, "err_msg": "param 'M' (513) should be in range [2, 512]"}
         },
         {
             "description": "String Type Test will ignore the wrong type",
@@ -173,7 +176,7 @@ class GPU_HNSW_SQ:
         },
         {
             "description": "Maximum boundary combination",
-            "params": {"M": 2048, "efConstruction": 10000, "sq_type": "FP16", "refine": True, "refine_type": "FP32"},
+            "params": {"M": 512, "efConstruction": 10000, "sq_type": "FP16", "refine": True, "refine_type": "FP32"},
             "expected": success
         },
     ]

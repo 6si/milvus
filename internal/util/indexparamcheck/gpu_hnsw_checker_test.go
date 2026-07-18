@@ -57,7 +57,19 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 	invalidMParamsMin[HNSWM] = strconv.Itoa(HNSWMinM - 1)
 
 	invalidMParamsMax := copyParams(validParams)
-	invalidMParamsMax[HNSWM] = strconv.Itoa(HNSWMaxM + 1)
+	invalidMParamsMax[HNSWM] = strconv.Itoa(gpuHnswMaxM + 1)
+
+	// M and efConstruction are optional (knowhere fills defaults), matching CPU
+	// HNSW: a create request that omits them must be accepted.
+	mOmitted := copyParams(validParams)
+	delete(mOmitted, HNSWM)
+
+	efOmitted := copyParams(validParams)
+	delete(efOmitted, EFConstruction)
+
+	bothOmitted := copyParams(validParams)
+	delete(bothOmitted, HNSWM)
+	delete(bothOmitted, EFConstruction)
 
 	p1 := map[string]string{
 		DIM:            strconv.Itoa(128),
@@ -118,11 +130,25 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 		Metric:         metric.COSINE,
 	}
 	// M so large the padded layer-0 staging next_pow2(2*M) exceeds the max GPU
-	// block size even at search_width=1 (M=600 => next_pow2(1200)=2048 > 1024).
-	// In range [1, 2048] but unsearchable on GPU, so must be rejected.
+	// block size even at search_width=1 (M=600 => next_pow2(1200)=2048 > 1024),
+	// so it exceeds the GPU max (gpuHnswMaxM=512) and must be rejected.
 	p10 := map[string]string{
 		DIM:            strconv.Itoa(128),
 		HNSWM:          strconv.Itoa(600),
+		EFConstruction: strconv.Itoa(200),
+		Metric:         metric.COSINE,
+	}
+	// M at exactly the GPU max (512 => next_pow2(1024)=1024, fits one block).
+	pMaxM := map[string]string{
+		DIM:            strconv.Itoa(128),
+		HNSWM:          strconv.Itoa(gpuHnswMaxM),
+		EFConstruction: strconv.Itoa(200),
+		Metric:         metric.COSINE,
+	}
+	// One above the GPU max must be rejected.
+	pOverMaxM := map[string]string{
+		DIM:            strconv.Itoa(128),
+		HNSWM:          strconv.Itoa(gpuHnswMaxM + 1),
 		EFConstruction: strconv.Itoa(200),
 		Metric:         metric.COSINE,
 	}
@@ -146,6 +172,11 @@ func Test_gpuHnswChecker_CheckTrain(t *testing.T) {
 		{p8, true},   // 384-d COSINE
 		{p9, true},   // non-power-of-two 2*M (staging padded)
 		{p10, false}, // M too large: padded staging exceeds GPU block size
+		{pMaxM, true},     // M == gpuHnswMaxM (512): exactly fits one block
+		{pOverMaxM, false}, // M == gpuHnswMaxM+1 (513): out of GPU range
+		{mOmitted, true},   // M optional: omitted => knowhere default
+		{efOmitted, true},  // efConstruction optional: omitted => knowhere default
+		{bothOmitted, true}, // both optional: omitted => knowhere defaults
 	}
 
 	c := requireGpuHnswChecker(t)

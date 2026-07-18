@@ -23,19 +23,22 @@ class GPU_HNSW:
             "expected": success
         },
         {
+            # GPU max M is 512 (not the CPU HNSW 2048): the search kernel stages
+            # next_pow2(2*M) candidates in one CUDA block (<=1024 threads), so
+            # M>512 would build but never be GPU-searchable.
             "description": "Maximum Boundary Test",
-            "params": {"M": 2048},
+            "params": {"M": 512},
             "expected": success
         },
         {
             "description": "Out of Range Test - Negative",
             "params": {"M": -1},
-            "expected": {"err_code": 999, "err_msg": "param 'M' (-1) should be in range [2, 2048]"}
+            "expected": {"err_code": 999, "err_msg": "param 'M' (-1) should be in range [2, 512]"}
         },
         {
             "description": "Out of Range Test - Too Large",
-            "params": {"M": 2049},
-            "expected": {"err_code": 999, "err_msg": "param 'M' (2049) should be in range [2, 2048]"}
+            "params": {"M": 513},
+            "expected": {"err_code": 999, "err_msg": "param 'M' (513) should be in range [2, 512]"}
         },
         {
             "description": "String Type Test will ignore the wrong type",
