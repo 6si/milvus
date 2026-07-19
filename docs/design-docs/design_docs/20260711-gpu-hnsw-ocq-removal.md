@@ -85,7 +85,13 @@ If a future workload is proven to be `ef`-ceiling-bound and short on recall, OCQ
 
 # Related Decision: Filtered search (delete / TTL / partition bitset) is unsupported
 
-- **Status:** Accepted (documented limitation; GPU-side filtering is a follow-up)
+- **Status:** ~~Accepted (documented limitation; GPU-side filtering is a follow-up)~~
+  **SUPERSEDED (2026-07-18)** by
+  [20260718-gpu-hnsw-filtered-search.md](20260718-gpu-hnsw-filtered-search.md).
+  Option 2 below (GPU-side bitset filtering) has since been implemented and
+  validated at CPU-HNSW parity on GPU capacity, so the hard reject is removed and
+  GPU_HNSW is no longer scoped to append-mostly / immutable collections. The
+  section is retained for historical context.
 
 ## Context
 
@@ -117,16 +123,23 @@ through when the caller omits `num_filtered_out_bits`).
 
 ## Decision
 
-Keep the hard reject, document it as an explicit failure mode in
+> **Superseded (2026-07-18).** The original decision below was to keep the hard
+> reject until GPU capacity was available. Option 2 has since been implemented and
+> validated, so the reject is removed. Historical decision preserved:
+
+~~Keep the hard reject, document it as an explicit failure mode in
 `20260619-gpu-hnsw.md`, and scope GPU_HNSW/GPU_HNSW_SQ to append-mostly /
 immutable collections until GPU-side bitset filtering (option 2) is implemented
-and benchmarked on real GPU capacity.
+and benchmarked on real GPU capacity.~~
 
 ## Follow-up
 
-Implement in-kernel bitset filtering with over-fetch (option 2) and add a
-recall/latency benchmark under filtering once GPU capacity returns. Until then,
-the reject prevents silently-wrong results.
+**Done (2026-07-18):** in-kernel bitset filtering with brute-force fallback
+(option 2) is implemented and validated at CPU-HNSW parity across L2/IP/COSINE
+and delete ratios on sealed, GPU-indexed segments. See
+[20260718-gpu-hnsw-filtered-search.md](20260718-gpu-hnsw-filtered-search.md) for
+the design and the delete-then-query integration tests
+(`tests/python_client/testcases/indexes/test_gpu_hnsw.py`).
 
 ---
 

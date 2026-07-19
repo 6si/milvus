@@ -189,6 +189,85 @@ class TestGpuHnswSQBuildParams(TestMilvusClientV2Base):
                                  "pk_name": pk_field_name})
 
 
+class TestGpuHnswSQFilteredSearch(TestMilvusClientV2Base):
+    """Delete-then-query / filtered-search parity for GPU_HNSW_SQ.
+
+    GPU_HNSW_SQ is an alias of GPU_HNSW and shares its GPU search/filter path, so
+    it must apply the delete/TTL/partition BitsetView too (design doc
+    20260718-gpu-hnsw-filtered-search.md): a search after a delete excludes the
+    deleted rows and keeps the live ones, with no invalid_args error.
+    """
+
+    @pytest.mark.tags(CaseLabel.L1)
+    @pytest.mark.parametrize("metric", GPU_HNSW_SQ.supported_metrics)
+    def test_gpu_hnsw_sq_delete_then_search(self, metric):
+        """
+        Delete a subset of rows, then search/query and verify the deleted rows
+        are absent and the live rows are still returned (no invalid_args).
+        """
+        client = self._client()
+        collection_name = cf.gen_collection_name_by_testcase_name()
+        schema, _ = self.create_schema(client)
+        schema.add_field(pk_field_name, datatype=DataType.INT64, is_primary=True, auto_id=False)
+        schema.add_field(vector_field_name, datatype=DataType.FLOAT_VECTOR, dim=dim)
+        # Strong consistency so the delete is visible to the immediately-following query
+        self.create_collection(client, collection_name, schema=schema, consistency_level="Strong")
+
+        # insert, then flush so the segment seals and gets a GPU_HNSW_SQ index
+        nb = default_nb
+        random_vectors = list(cf.gen_vectors(nb, dim, vector_data_type=DataType.FLOAT_VECTOR))
+        rows = [{pk_field_name: i, vector_field_name: random_vectors[i]} for i in range(nb)]
+        self.insert(client, collection_name, rows)
+        self.flush(client, collection_name)
+
+        index_params = self.prepare_index_params(client)[0]
+        index_params.add_index(field_name=vector_field_name,
+                               metric_type=metric,
+                               index_type=index_type,
+                               params=default_build_params)
+        self.create_index(client, collection_name, index_params)
+        self.wait_for_index_ready(client, collection_name, index_name=vector_field_name)
+        self.load_collection(client, collection_name)
+
+        # delete the first delete_num primary keys
+        delete_num = 100
+        deleted_pks = [i for i in range(delete_num)]
+        self.delete(client, collection_name, ids=deleted_pks)
+
+        # search over the whole collection: deleted ids must not appear, and the
+        # call must succeed (no invalid_args from a non-empty delete bitset)
+        surviving_ids = [i for i in range(delete_num, nb)]
+        nq = 2
+        search_vectors = cf.gen_vectors(nq, dim=dim, vector_data_type=DataType.FLOAT_VECTOR)
+        self.search(client, collection_name, search_vectors,
+                    search_params=default_search_params,
+                    limit=ct.default_limit,
+                    check_task=CheckTasks.check_search_results,
+                    check_items={"enable_milvus_client_api": True,
+                                 "nq": nq,
+                                 "limit": ct.default_limit,
+                                 "pk_name": pk_field_name})
+        res, _ = self.search(client, collection_name, search_vectors,
+                             search_params=default_search_params,
+                             limit=ct.default_limit)
+        for hits in res:
+            for hit in hits:
+                assert hit.get("id") not in deleted_pks, \
+                    f"deleted id {hit.get('id')} returned by GPU_HNSW_SQ search after delete"
+
+        # query the deleted range: must be empty; query the live range: must be present
+        deleted_expr = f"{pk_field_name} < {delete_num}"
+        self.query(client, collection_name, filter=deleted_expr,
+                   check_task=CheckTasks.check_query_results,
+                   check_items={"exp_res": [], "pk_name": pk_field_name})
+        live_res, _ = self.query(client, collection_name,
+                                 filter=f"{pk_field_name} >= {delete_num} and {pk_field_name} < {delete_num + 10}",
+                                 output_fields=[pk_field_name])
+        returned = sorted(r[pk_field_name] for r in live_res)
+        assert returned == surviving_ids[:10], \
+            f"live rows missing after delete: expected {surviving_ids[:10]}, got {returned}"
+
+
 @pytest.mark.xdist_group("TestGpuHnswSQSearchParams")
 class TestGpuHnswSQSearchParams(TestMilvusClientV2Base):
     """Test search with pagination functionality for GPU_HNSW_SQ index"""

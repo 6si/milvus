@@ -2,7 +2,8 @@
 
 - **Created:** 2026-07-18
 - **Author(s):** @6si
-- **Status:** Draft
+- **Status:** Implemented (GPU-side filtered search landed; validated at CPU-HNSW
+  parity across L2/IP/COSINE and delete ratios on sealed, GPU-indexed segments)
 - **Component:** Index | QueryNode
 - **Related Issues:** milvus-io/milvus#50653, zilliztech/knowhere#1686
 - **Related design docs:** [20260619-gpu-hnsw.md](20260619-gpu-hnsw.md),
