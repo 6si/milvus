@@ -18,9 +18,11 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # rather than the branch name: a branch is mutable and the build could change
 # with no milvus PR. Repoint to a tagged 6si/knowhere release before merging to
 # production. This SHA carries GPU-side filtered search (deletes/TTL/partition
-# bitset) plus the H1 warp-cooperative layer-0 distance (coalesced dataset
+# bitset), the H1 warp-cooperative layer-0 distance (coalesced dataset
 # loads: sectors/request 12.1->3.10, ~1.57x int8 / ~1.85x fp32 kernel-only,
-# recall-identical); prior pin 45e2ba26 lacked the H1 coalescing change.
+# recall-identical), plus the nq-chunked visited-bitmap fix that bounds the
+# grow-only search scratch (prevents the high-concurrency VRAM OOM seen in
+# v90); prior pin 45e2ba26 lacked the H1 coalescing and the OOM fix.
 set( KNOWHERE_VERSION 2b52090d70c5d61081e23438cea6107cff633a62 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
