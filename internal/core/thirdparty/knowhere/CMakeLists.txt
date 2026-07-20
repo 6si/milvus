@@ -21,7 +21,7 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # bitset) plus the H1 warp-cooperative layer-0 distance (coalesced dataset
 # loads: sectors/request 12.1->3.10, ~1.57x int8 / ~1.85x fp32 kernel-only,
 # recall-identical); prior pin 45e2ba26 lacked the H1 coalescing change.
-set( KNOWHERE_VERSION 407b60958cc9c1f85d41441313fa352fe06a184b )
+set( KNOWHERE_VERSION 2b52090d70c5d61081e23438cea6107cff633a62 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
