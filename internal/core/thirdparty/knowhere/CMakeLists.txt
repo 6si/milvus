@@ -23,7 +23,7 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # recall-identical), plus the nq-chunked visited-bitmap fix that bounds the
 # grow-only search scratch (prevents the high-concurrency VRAM OOM seen in
 # v90); prior pin 45e2ba26 lacked the H1 coalescing and the OOM fix.
-set( KNOWHERE_VERSION 2b52090d70c5d61081e23438cea6107cff633a62 )
+set( KNOWHERE_VERSION f7126691580516803087afe66b0bfad0d0d3fcc3 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
