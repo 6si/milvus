@@ -29,7 +29,10 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # vectors (components ~1/sqrt(d)) onto a few of the 256 levels, so int8 cosine
 # is re-encoded as fp16 at load (validated fp16 GPU path; the int8 query is
 # widened to fp32 through searchHost). int8 L2/IP keep direct_signed + DP4A.
-set( KNOWHERE_VERSION cbc2893fe7b52885f4a4a74f70863a9f02244946 )
+# c6145359: mirror faiss PR #10 review fixes into vendored faiss — upload the
+# filter bitset in GpuIndexHNSW::searchImpl_ (standard search() path) and guard
+# extract_hnsw_layers against an OOB nb_neighbors(1) read on a layer-0-only index.
+set( KNOWHERE_VERSION c614535928ef223c21b9b9281849c0f6efa7dc12 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
