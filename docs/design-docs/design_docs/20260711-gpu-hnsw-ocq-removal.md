@@ -215,8 +215,16 @@ auto-accepts them through the cgo feature flags (no Go logic change).
 
 ## Verification status
 
-The CUDA changes are **compile-verified only** (this environment has no GPU
-runtime). The added Knowhere unit tests (`Test GPU HNSW FP16/BF16
-Deserialization`) and GPU recall/latency/VRAM behavior require a real GPU eval,
-which is pending capacity — GPU-runtime correctness is therefore **not yet
-validated**.
+The CUDA changes are **GPU-runtime validated**. FP16/BF16 storage and cosine
+recall are exercised by dedicated GPU tests in both repos:
+
+- faiss `TestGpuIndexHNSW`: `SQ_Fp16_Cosine` and `SQ_Bf16_Cosine` (recall bars
+  0.85 / 0.80), alongside the fp16 L2 and int8 L2 gates (9/9 pass).
+- knowhere GPU HNSW suite: FP16/BF16 deserialization + search tests, a
+  brute-force cosine oracle comparison, a CUDA upload fault-injection test, and
+  an FP16 P1 regression test (16 tests, 202,360 assertions, 0 failures).
+
+Measured recall: fp16-COSINE 0.998, bf16-COSINE 0.983, int8-COSINE 0.9975,
+sq8-COSINE 0.9855. End-to-end cluster eval on `milvus-gpu:gpu-hnsw-faiss-native-v1`
+covers the full dtype × metric matrix (FP32/FP16/BF16/INT8 × L2/IP/COSINE),
+filtered search, deletes/TTL/partition visibility, and VRAM/OOM behavior.

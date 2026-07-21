@@ -21,9 +21,9 @@
 > eviction / parent-selection decision tree spelled out (§5.3.1). Added
 > `needs_bf_count` and `accumulated_alpha` init details (§5.4). **Rejected** the
 > "12 B/slot" smem correction: the code has **six** `ef`-length arrays
-> (`result_*` + `merged_*`, `GpuHnswSearchKernel.cuh:480-490,669-680`) and a
-> `/24` divisor (`GpuHnswSearch.cuh:172-173`); the merge is **not** in-place
-> (`merged_*` written at `:408-417`, copied back at `:421-425`). Base stays
+> (`result_*` + `merged_*`, `GpuHnswSearchKernel.cuh:731-741,1109-1118`) and a
+> `/24` divisor (`GpuHnswSearch.cuh:214-219`); the merge is **not** in-place
+> (`merged_*` written at `:478-484`, copied back at `:491-493`). Base stays
 > 24 B/ef ⇒ with the +12 B invalid frontier, `max_ef ≈ (smem−overhead)/36`
 > (§5.5).
 
@@ -213,7 +213,7 @@ Mirror §3.1–3.2 inside `layer0_beam_search_kernel`:
   (b) the alpha-gated entry into the invalid frontier.
 - **Upper layers unchanged.** `upper_layer_search_kernel` only routes; results
   come from layer 0. Leave greedy descent alone — deleted nodes still route.
-- **Copy-out** (`GpuHnswSearchKernel.cuh:651`): emit only valid ids into the `k`
+- **Copy-out** (`GpuHnswSearchKernel.cuh:1052-1073`): emit only valid ids into the `k`
   outputs; pad with sentinels as today when fewer than `k` valid survive (the BF
   fallback in §5.4 then fills those queries).
 - Thread `d_bitset` / `N` / `kAlpha` through **all 5** layer-0 specializations
@@ -300,17 +300,17 @@ The current per-`ef` cost is **24 B/slot — six `ef`-length arrays**, verified
 against source (not 12 B):
 - The smem pointer layout allocates **three result arrays and three merge
   arrays**, each length `ef`: `result_ids/result_dists/is_expanded`
-  (`GpuHnswSearchKernel.cuh:480-482`) **and**
-  `merged_ids/merged_dists/merged_expanded` (`GpuHnswSearchKernel.cuh:488-490`).
-- `calc_layer0_smem_size` sums all six (`GpuHnswSearchKernel.cuh:669-680`).
+  (`GpuHnswSearchKernel.cuh:731-733`) **and**
+  `merged_ids/merged_dists/merged_expanded` (`GpuHnswSearchKernel.cuh:739-741`).
+- `calc_layer0_smem_size` sums all six (`GpuHnswSearchKernel.cuh:1109-1118`).
 - The fit check divisor is explicit: `int max_ef = (smem_max − smem_overhead) / 24;`
   with the comment *"3 result arrays + 3 merge arrays = 6 × 4 = 24 bytes/slot"*
-  (`GpuHnswSearch.cuh:172-173`).
+  (`GpuHnswSearch.cuh:214-219`).
 - The merge is **not** in-place: `parallel_merge_into_result` writes candidates
-  into the `merged_*` arrays (`:408-417`) then copies them back into `result_*`
-  (`:421-425`). The `merged_*` arrays are what make the base 24 B, not 12 B.
-  (The `/12` and "no merged arrays" reading cites `GpuHnswSearch.cuh:130`, which
-  is the `block_size` default, not the `max_ef` calc at `:173`.)
+  into the `merged_*` arrays (`:478-484`) then copies them back into `result_*`
+  (`:491-493`). The `merged_*` arrays are what make the base 24 B, not 12 B.
+  (The `/12` and "no merged arrays" reading cites `GpuHnswSearch.cuh:165`, which
+  is the `block_size` default, not the `max_ef` calc at `:219`.)
 
 Because validity is packed into `is_expanded` (no new result-beam array), the
 result beam stays **24 B/ef**. The invalid frontier adds **12 B/ef_inv**
