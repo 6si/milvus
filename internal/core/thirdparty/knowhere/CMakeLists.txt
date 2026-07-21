@@ -25,7 +25,11 @@ set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES 
 # warp-cooperative layer-0 distance, and the nq-chunked visited-bitmap OOM fix
 # from the prior gpu-hnsw-faiss pin (f7126691). Quantized-cosine numerics differ
 # from the legacy inverse-norm path (recall-gated; may require re-ingest).
-set( KNOWHERE_VERSION 4377e5156451dce501b9e811f4368edaf56634a8 )
+# cbc2893f: accurate int8 cosine. QT_8bit_direct_signed collapses L2-normalized
+# vectors (components ~1/sqrt(d)) onto a few of the 256 levels, so int8 cosine
+# is re-encoded as fp16 at load (validated fp16 GPU path; the int8 query is
+# widened to fp32 through searchHost). int8 L2/IP keep direct_signed + DP4A.
+set( KNOWHERE_VERSION cbc2893fe7b52885f4a4a74f70863a9f02244946 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
