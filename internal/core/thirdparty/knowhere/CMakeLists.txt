@@ -14,16 +14,18 @@
 # Update KNOWHERE_VERSION for the first occurrence
 milvus_add_pkg_config("knowhere")
 set_property(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR} PROPERTY INCLUDE_DIRECTORIES "")
-# Pinned to an immutable commit SHA on 6si/knowhere@gpu-hnsw-faiss
+# Pinned to an immutable commit SHA on 6si/knowhere@gpu-hnsw-faiss-native
 # rather than the branch name: a branch is mutable and the build could change
 # with no milvus PR. Repoint to a tagged 6si/knowhere release before merging to
-# production. This SHA carries GPU-side filtered search (deletes/TTL/partition
-# bitset), the H1 warp-cooperative layer-0 distance (coalesced dataset
-# loads: sectors/request 12.1->3.10, ~1.57x int8 / ~1.85x fp32 kernel-only,
-# recall-identical), plus the nq-chunked visited-bitmap fix that bounds the
-# grow-only search scratch (prevents the high-concurrency VRAM OOM seen in
-# v90); prior pin 45e2ba26 lacked the H1 coalescing and the OOM fix.
-set( KNOWHERE_VERSION f7126691580516803087afe66b0bfad0d0d3fcc3 )
+# production. This SHA re-vendors the vanilla-faiss-structured GpuIndexHNSW
+# (built on faiss::IndexHNSW, cppcontrib-free) and rewires GpuHnswIndexNode to
+# be a pure consumer of it: the deserialized cppcontrib index is converted to a
+# vanilla faiss::IndexHNSW and uploaded via copyFrom(), cosine folded into
+# normalize+IP. It carries forward the GPU-side filtered search, the H1
+# warp-cooperative layer-0 distance, and the nq-chunked visited-bitmap OOM fix
+# from the prior gpu-hnsw-faiss pin (f7126691). Quantized-cosine numerics differ
+# from the legacy inverse-norm path (recall-gated; may require re-ingest).
+set( KNOWHERE_VERSION 4377e5156451dce501b9e811f4368edaf56634a8 )
 set( GIT_REPOSITORY  "https://github.com/6si/knowhere.git")
 
 message(STATUS "Knowhere repo: ${GIT_REPOSITORY}")
