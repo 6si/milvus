@@ -140,6 +140,18 @@ func buildCLoadIndexInfo(field *schemapb.FieldSchema, segment *querypb.SegmentLo
 		}
 	}
 
+	// The FieldIndexInfo frequently omits the row count (it carries index
+	// metadata, not segment stats), which leaves NumRows==0 in the C load info.
+	// Knowhere's load-resource estimator multiplies rows*dim to size the
+	// transient host peak (notably the fp32-expanded GPU_HNSW upload), so a
+	// zero here collapses the estimate to ~file_size and lets the loader admit
+	// far too many concurrent uploads. Fall back to the segment's row count,
+	// which equals the indexed vector count for a sealed segment.
+	numRows := index.GetNumRows()
+	if numRows <= 0 {
+		numRows = segment.GetNumOfRows()
+	}
+
 	return &cgopb.LoadIndexInfo{
 		CollectionID:              segment.GetCollectionID(),
 		PartitionID:               segment.GetPartitionID(),
@@ -153,7 +165,7 @@ func buildCLoadIndexInfo(field *schemapb.FieldSchema, segment *querypb.SegmentLo
 		IndexFiles:                index.GetIndexFilePaths(),
 		IndexEngineVersion:        index.GetCurrentIndexVersion(),
 		IndexFileSize:             index.GetIndexSize(),
-		NumRows:                   index.GetNumRows(),
+		NumRows:                   numRows,
 		CurrentScalarIndexVersion: index.GetCurrentScalarIndexVersion(),
 		IndexStorePathVersion:     index.GetIndexStorePathVersion(),
 	}, nil

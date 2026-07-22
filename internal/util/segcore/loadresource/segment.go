@@ -371,12 +371,23 @@ func EstimateSegmentLoadingResource(ctx context.Context, schema *schemapb.Collec
 					fieldIndexInfo.GetBuildID())
 			}
 
+			// Non-tiered: the caching layer is bypassed, so every index's
+			// transient peak (MaxMemoryBytes) and disk cost are charged here.
+			// Tiered eviction: the caching layer (MCL) tracks only resident cost,
+			// so these additions are normally skipped. GPU indexes are the
+			// exception: a GPU_HNSW upload materializes the CPU index + fp32
+			// staging in host RAM (~2x file size) and frees it once vectors reach
+			// VRAM, leaving resident host cost ~0. That transient peak is invisible
+			// to MCL, so it must still be charged to the loading estimate;
+			// otherwise concurrent loads are admitted against a ~0-cost estimate
+			// and the accumulated peaks OOM the node.
+			requiresGpu := gpuIndexRequiresGpu(fieldIndexInfo.IndexParams)
+			indexMemorySize += indexLoadingMemoryContribution(options.TieredEvictionEnabled, requiresGpu, estimateResult.MaxMemoryBytes)
 			if !options.TieredEvictionEnabled {
-				indexMemorySize += estimateResult.MaxMemoryBytes
 				segDiskLoadingSize += estimateResult.MaxDiskBytes
 			}
 
-			if gpuIndexRequiresGpu(fieldIndexInfo.IndexParams) {
+			if requiresGpu {
 				fieldGPUMemorySize = append(fieldGPUMemorySize, estimateResult.MaxMemoryBytes)
 			}
 
@@ -701,6 +712,22 @@ func getFieldWarmupPolicyForLoading(field *schemapb.FieldSchema) string {
 	return paramtable.Get().QueryNodeCfg.TieredWarmupScalarField.GetValue()
 }
 
+// indexLoadingMemoryContribution returns the transient host memory (bytes) to
+// charge to the segment loading estimate for a single index field.
+//
+// With tiered eviction disabled the caching layer is bypassed, so every index's
+// upload peak (maxMemoryBytes) is charged directly. With tiered eviction enabled
+// the caching layer tracks resident cost and this is normally 0, except for GPU
+// indexes, whose upload peak is transient host RAM freed once vectors reach VRAM
+// and is therefore never seen by the caching layer. Charging it here lets tiered
+// admission reserve the peak and throttle concurrent loads.
+func indexLoadingMemoryContribution(tieredEvictionEnabled, isGpuIndex bool, maxMemoryBytes uint64) uint64 {
+	if !tieredEvictionEnabled || isGpuIndex {
+		return maxMemoryBytes
+	}
+	return 0
+}
+
 func gpuIndexRequiresGpu(indexParams []*commonpb.KeyValuePair) bool {
 	indexParamMap := funcutil.KeyValuePair2Map(indexParams)
 	indexType := indexParamMap[common.IndexTypeKey]
@@ -709,7 +736,10 @@ func gpuIndexRequiresGpu(indexParams []*commonpb.KeyValuePair) bool {
 	case "GPU_CAGRA", "GPU_CUVS_CAGRA":
 	case "GPU_BRUTE_FORCE", "GPU_CUVS_BRUTE_FORCE",
 		"GPU_IVF_FLAT", "GPU_CUVS_IVF_FLAT",
-		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ":
+		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ",
+		// GPU_HNSW / GPU_HNSW_SQ load directly on the GPU with no
+		// adapt_for_cpu step, so they always require GPU resources.
+		"GPU_HNSW", "GPU_HNSW_SQ":
 		return true
 	default:
 		return false

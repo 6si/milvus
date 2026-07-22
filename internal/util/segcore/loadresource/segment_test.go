@@ -400,3 +400,51 @@ func TestEstimateSegmentLoadingResourceKeepsMilvusTableRealPKEager(t *testing.T)
 	require.Zero(t, usage.DiskBytes)
 	require.EqualValues(t, 100, loadInfo.GetEstimatedBytesPerRow())
 }
+
+func TestIndexLoadingMemoryContribution(t *testing.T) {
+	const peak = uint64(4 << 30) // 4 GiB transient upload peak
+
+	tests := []struct {
+		name          string
+		tieredEnabled bool
+		isGpuIndex    bool
+		expected      uint64
+	}{
+		{
+			name:          "tiered disabled, cpu index: charge peak (caching layer bypassed)",
+			tieredEnabled: false,
+			isGpuIndex:    false,
+			expected:      peak,
+		},
+		{
+			name:          "tiered disabled, gpu index: charge peak",
+			tieredEnabled: false,
+			isGpuIndex:    true,
+			expected:      peak,
+		},
+		{
+			// With tiered eviction on, MCL tracks resident cost only, and
+			// GPU_HNSW's resident host cost is ~0, so its transient upload peak
+			// is invisible unless charged here. Must charge the peak.
+			name:          "tiered enabled, gpu index: still charge transient peak (OOM fix)",
+			tieredEnabled: true,
+			isGpuIndex:    true,
+			expected:      peak,
+		},
+		{
+			// CPU index resident cost is tracked by the caching layer, so nothing
+			// extra is charged to the loading estimate.
+			name:          "tiered enabled, cpu index: caching layer accounts for it",
+			tieredEnabled: true,
+			isGpuIndex:    false,
+			expected:      0,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			require.Equal(t, test.expected,
+				indexLoadingMemoryContribution(test.tieredEnabled, test.isGpuIndex, peak))
+		})
+	}
+}

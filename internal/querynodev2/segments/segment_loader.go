@@ -2096,7 +2096,10 @@ func gpuIndexRequiresGpu(indexParams []*commonpb.KeyValuePair) bool {
 	case "GPU_CAGRA", "GPU_CUVS_CAGRA":
 	case "GPU_BRUTE_FORCE", "GPU_CUVS_BRUTE_FORCE",
 		"GPU_IVF_FLAT", "GPU_CUVS_IVF_FLAT",
-		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ":
+		"GPU_IVF_PQ", "GPU_CUVS_IVF_PQ",
+		// GPU_HNSW / GPU_HNSW_SQ load directly on the GPU with no
+		// adapt_for_cpu step, so they always require GPU resources.
+		"GPU_HNSW", "GPU_HNSW_SQ":
 		return true
 	default:
 		return false
