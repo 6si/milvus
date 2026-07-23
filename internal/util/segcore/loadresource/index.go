@@ -49,6 +49,10 @@ type IndexResourceUsage struct {
 	FinalMemoryBytes uint64
 	FinalDiskBytes   uint64
 	HasRawData       bool
+	// GpuMemoryBytes is the per-segment device (VRAM) footprint retained after
+	// load; 0 for CPU indexes and for GPU indexes that do not report a distinct
+	// device footprint (those fall back to MaxMemoryBytes for GPU admission).
+	GpuMemoryBytes uint64
 }
 
 type Runner func(func() error) error
@@ -203,5 +207,6 @@ func indexResourceUsageFromC(estimate *C.LoadResourceRequest) IndexResourceUsage
 		FinalMemoryBytes: uint64(estimate.final_memory_cost),
 		FinalDiskBytes:   uint64(estimate.final_disk_cost),
 		HasRawData:       bool(estimate.has_raw_data),
+		GpuMemoryBytes:   uint64(estimate.gpu_memory_cost),
 	}
 }

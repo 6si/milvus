@@ -388,7 +388,17 @@ func EstimateSegmentLoadingResource(ctx context.Context, schema *schemapb.Collec
 			}
 
 			if requiresGpu {
-				fieldGPUMemorySize = append(fieldGPUMemorySize, estimateResult.MaxMemoryBytes)
+				// GPU admission reserves the incremental VRAM a segment adds against
+				// actual device free memory. Prefer the index-reported device
+				// footprint; fall back to the host transient MaxMemoryBytes for GPU
+				// indexes that don't report one. This avoids charging the (larger)
+				// host reconstruct/upload peak against VRAM, which over-reserves and
+				// falsely rejects loads.
+				gpuMemoryBytes := estimateResult.GpuMemoryBytes
+				if gpuMemoryBytes == 0 {
+					gpuMemoryBytes = estimateResult.MaxMemoryBytes
+				}
+				fieldGPUMemorySize = append(fieldGPUMemorySize, gpuMemoryBytes)
 			}
 
 			// could skip binlog or
