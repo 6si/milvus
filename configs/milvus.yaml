@@ -453,6 +453,7 @@ queryCoord:
   autoBalanceChannel: true # Enable auto balance channel
   balancer: ChannelLevelScoreBalancer # auto balancer used for segments on queryNodes
   globalRowCountFactor: 0.1 # the weight used when balancing segments among queryNodes
+  scoreBasedBalanceSegmentCountFactor: 0 # per-segment weight (in row-count-equivalent units) added to the score-based balancer node score; 0 keeps the existing row-only behavior, >0 also equalizes segment count across queryNodes
   scoreUnbalanceTolerationFactor: 0.05 # the least value for unbalanced extent between from and to nodes when doing balance
   reverseUnBalanceTolerationFactor: 1.3 # the largest value for unbalanced extent between from and to nodes after doing balance
   overloadedMemoryThresholdPercentage: 90 # The threshold of memory usage (in percentage) in a query node to trigger the sealed segment balancing.
