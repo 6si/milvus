@@ -189,6 +189,45 @@ func TestGeneratePlans_UnderFill_ReclaimsDeletedSpace(t *testing.T) {
 	assert.Equal(t, 10, coveredSegmentCount(plansOn))
 }
 
+// Adversarial: the under-fill packer commits (removes) a selection before the
+// underFillReducesCount check, and forms multiple packs when candidates exceed a
+// single group target. Verify the loop terminates and every scheduled segment is
+// unique and drawn from the input (no duplicate/lost segments across buckets),
+// and that a trailing group too small to satisfy minSegment is safely left for a
+// future round rather than emitted or spun on forever.
+func TestGeneratePlans_UnderFill_NoDuplicateOrLostSegments(t *testing.T) {
+	on := underFillTrigger(t, true)
+
+	// 40 dead-band segments at 0.6*expected. groupFactor=8 -> groupTarget=8*exp
+	// fits floor(8/0.6)=13 per pack: packs of 13,13,13 (each reduces count), and
+	// a trailing single segment that cannot meet minSegment(3) -> left behind.
+	in := make([]*SegmentInfo, 0, 40)
+	inputIDs := make(map[int64]struct{}, 40)
+	for i := int64(0); i < 40; i++ {
+		s := newUnderFillSeg(6000+i, frac(0.6), 6000, 0)
+		in = append(in, s)
+		inputIDs[s.GetID()] = struct{}{}
+	}
+
+	plans := on.generatePlans(in, underFillSignal(), &compactTime{}, underFillExpectedSize)
+	assert.NotEmpty(t, plans)
+
+	seen := make(map[int64]int)
+	for _, p := range plans {
+		for _, id := range p.B {
+			seen[id]++
+			_, ok := inputIDs[id]
+			assert.True(t, ok, "scheduled segment %d must come from the input set", id)
+		}
+	}
+	for id, n := range seen {
+		assert.Equal(t, 1, n, "segment %d scheduled in more than one bucket", id)
+	}
+	// 39 scheduled (13*3); the 1 leftover cannot form a group and is deferred.
+	assert.Equal(t, 39, coveredSegmentCount(plans))
+	assert.Len(t, seen, 39)
+}
+
 // isUnderFullSegment classification boundaries.
 func TestIsUnderFullSegment(t *testing.T) {
 	tr := underFillTrigger(t, true)
