@@ -454,7 +454,10 @@ func (t *compactionTrigger) generatePlans(segments []*SegmentInfo, signal *compa
 	// TODO add low priority candidates, for example if the segment is smaller than full 0.9 * max segment size but larger than small segment boundary, we only execute compaction when there are no compaction running actively
 	var prioritizedCandidates []*SegmentInfo
 	var smallCandidates []*SegmentInfo
+	var nonFullCandidates []*SegmentInfo
 	var nonPlannedSegments []*SegmentInfo
+
+	underFillEnabled := Params.DataCoordCfg.CompactionUnderFillEnable.GetAsBool()
 
 	// TODO, currently we lack of the measurement of data distribution, there should be another compaction help on redistributing segment based on scalar/vector field distribution
 	for _, segment := range segments {
@@ -464,6 +467,11 @@ func (t *compactionTrigger) generatePlans(segments []*SegmentInfo, signal *compa
 			prioritizedCandidates = append(prioritizedCandidates, segment)
 		} else if t.isSmallSegment(segment, expectedSize) {
 			smallCandidates = append(smallCandidates, segment)
+		} else if underFillEnabled && t.isUnderFullSegment(segment, expectedSize) {
+			// Not "small", but not full either: a half-full segment that today
+			// would be frozen forever (the dead-band). Collect it for the
+			// low-priority under-fill pass below.
+			nonFullCandidates = append(nonFullCandidates, segment)
 		} else {
 			nonPlannedSegments = append(nonPlannedSegments, segment)
 		}
@@ -518,6 +526,42 @@ func (t *compactionTrigger) generatePlans(segments []*SegmentInfo, signal *compa
 	}
 	smallRemaining := t.squeezeSmallSegmentsToBuckets(toMerge.candidates, buckets, expectedSize)
 
+	// 3. low-priority under-fill pass: repack half-full ("non-full") segments
+	// together with any leftover small segments into larger groups so the
+	// datanode writer rolls them into full-size output segments. Only runs when
+	// the compaction pipeline has spare capacity, and only emits groups that
+	// strictly reduce the resulting segment count (see underFillReducesCount).
+	if underFillEnabled && !signal.isForce && !t.inspector.isFull() {
+		underFillCandidates := make([]*SegmentInfo, 0, len(nonFullCandidates)+len(smallRemaining))
+		underFillCandidates = append(underFillCandidates, nonFullCandidates...)
+		underFillCandidates = append(underFillCandidates, smallRemaining...)
+		if len(underFillCandidates) > 0 {
+			groupFactor := Params.DataCoordCfg.CompactionUnderFillGroupFactor.GetAsInt64()
+			if groupFactor < 2 {
+				groupFactor = 2
+			}
+			groupTarget := expectedSize * groupFactor
+			toUnderFill := newSegmentPacker("underfill", underFillCandidates, compactTime)
+			for {
+				// No upper bound on leftover: the writer splits the bucket into
+				// full segments regardless, so grab as many under-filled
+				// segments as fit under groupTarget.
+				pack, _ := toUnderFill.pack(groupTarget, math.MaxInt64, minSegs, maxSegs)
+				if len(pack) == 0 {
+					break
+				}
+				if !underFillReducesCount(pack, expectedSize) {
+					// This group would not reduce the segment count (e.g. two
+					// nearly-full segments -> two full outputs). Skip it; the
+					// packed segments are already removed from the candidate set.
+					continue
+				}
+				reasons = append(reasons, fmt.Sprintf("under-fill repacking %d segments", len(pack)))
+				buckets = append(buckets, pack)
+			}
+		}
+	}
+
 	tasks := make([]*typeutil.Pair[int64, []int64], len(buckets))
 	for i, b := range buckets {
 		segmentIDs := make([]int64, 0)
@@ -535,6 +579,7 @@ func (t *compactionTrigger) generatePlans(segments []*SegmentInfo, signal *compa
 			mlog.FieldCollectionID(signal.collectionID),
 			mlog.Int("prioritizedCandidates", len(prioritizedCandidates)),
 			mlog.Int("smallCandidates", len(smallCandidates)),
+			mlog.Int("nonFullCandidates", len(nonFullCandidates)),
 			mlog.Int("nonPlannedSegments", len(nonPlannedSegments)),
 			mlog.Strings("reasons", reasons))
 	}
@@ -622,6 +667,43 @@ func (t *compactionTrigger) getCandidates(signal *compactionSignal) ([]chanPartS
 
 func (t *compactionTrigger) isSmallSegment(segment *SegmentInfo, expectedSize int64) bool {
 	return segment.getSegmentSize() < int64(float64(expectedSize)*Params.DataCoordCfg.SegmentSmallProportion.GetAsFloat())
+}
+
+// isUnderFullSegment reports whether a flushed segment is "under-filled": its
+// delete-adjusted (residual) size sits below compactableProportion*expectedSize,
+// so merging it with others would produce a fuller segment. Using residual size
+// (rather than raw size) means segments carrying accumulated deletes/upserts are
+// caught here and their reclaimable space is compacted away.
+//
+// A segment classified as small (isSmallSegment) is handled by the ordinary
+// small-segment merge path and is NOT considered under-full here.
+func (t *compactionTrigger) isUnderFullSegment(segment *SegmentInfo, expectedSize int64) bool {
+	if t.isSmallSegment(segment, expectedSize) {
+		return false
+	}
+	compactableProportion := Params.DataCoordCfg.SegmentCompactableProportion.GetAsFloat()
+	return segment.GetResidualSegmentSize() < int64(float64(expectedSize)*compactableProportion)
+}
+
+// underFillReducesCount reports whether repacking the given under-filled segments
+// into full expectedSize output segments would strictly reduce the segment count.
+// The datanode writer rolls a compaction bucket into ceil(sumResidual/expectedSize)
+// full segments, so a group is only worth compacting when that count is smaller
+// than the number of input segments. This guards against churning nearly-full
+// segments (e.g. two 0.6-full segments would yield two full outputs: no benefit).
+func underFillReducesCount(pack []*SegmentInfo, expectedSize int64) bool {
+	if len(pack) < 2 || expectedSize <= 0 {
+		return false
+	}
+	var totalResidual int64
+	for _, s := range pack {
+		totalResidual += s.GetResidualSegmentSize()
+	}
+	outputs := totalResidual / expectedSize
+	if totalResidual%expectedSize != 0 {
+		outputs++
+	}
+	return outputs < int64(len(pack))
 }
 
 func (t *compactionTrigger) isCompactableSegment(targetSize, expectedSize int64) bool {

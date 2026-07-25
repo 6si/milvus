@@ -5231,6 +5231,8 @@ type dataCoordConfig struct {
 	SegmentSmallProportion                     ParamItem `refreshable:"true"`
 	SegmentCompactableProportion               ParamItem `refreshable:"true"`
 	SegmentExpansionRate                       ParamItem `refreshable:"true"`
+	CompactionUnderFillEnable                  ParamItem `refreshable:"true"`
+	CompactionUnderFillGroupFactor             ParamItem `refreshable:"true"`
 	CompactionTimeoutInSeconds                 ParamItem `refreshable:"true"` // deprecated
 	CompactionDropToleranceInSeconds           ParamItem `refreshable:"true"`
 	CompactionGCIntervalInSeconds              ParamItem `refreshable:"true"`
@@ -5685,6 +5687,34 @@ During compaction, the size of segment # of rows is able to exceed segment max #
 		Export: true,
 	}
 	p.SegmentExpansionRate.Init(base.mgr)
+
+	p.CompactionUnderFillEnable = ParamItem{
+		Key:          "dataCoord.compaction.underfill.enable",
+		Version:      "2.6.19",
+		DefaultValue: "false",
+		Doc: `Enable the under-fill compaction pass. When enabled, flushed segments whose
+delete-adjusted (residual) size is below compactableProportion*maxSize but which are
+not "small" are repacked into fewer, fuller segments. This closes the dead-band of
+half-full segments that are otherwise never re-compacted, tightening the segment-size
+distribution and reclaiming space left by deletes/upserts. Runs at low priority (only
+when the compaction pipeline has spare capacity) and only emits plans that strictly
+reduce the segment count.`,
+		Export: true,
+	}
+	p.CompactionUnderFillEnable.Init(base.mgr)
+
+	p.CompactionUnderFillGroupFactor = ParamItem{
+		Key:          "dataCoord.compaction.underfill.groupFactor",
+		Version:      "2.6.19",
+		DefaultValue: "8",
+		Doc: `The under-fill pass groups under-filled segments into buckets whose total
+residual size targets groupFactor*maxSize before handing them to a single compaction
+task (the datanode writer then splits the bucket into full-size output segments).
+Larger values pack more segments per task (better fill efficiency) at the cost of
+larger individual compaction tasks. MUST be >= 2.`,
+		Export: true,
+	}
+	p.CompactionUnderFillGroupFactor.Init(base.mgr)
 
 	p.CompactionTimeoutInSeconds = ParamItem{
 		Key:          "dataCoord.compaction.timeout",

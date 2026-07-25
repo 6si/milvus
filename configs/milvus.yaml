@@ -760,6 +760,18 @@ dataCoord:
     scheduleInterval: 500 # The time interval in milliseconds for scheduling compaction tasks. If the configuration setting is below 100ms, it will be adjusted upwards to 100ms
     mix:
       triggerInterval: 60 # The time interval in seconds to trigger mix compaction
+    underfill:
+      # Enable the under-fill compaction pass. When enabled, flushed segments whose delete-adjusted (residual)
+      # size is below compactableProportion*maxSize but which are not "small" are repacked into fewer, fuller
+      # segments. This closes the dead-band of half-full segments that are otherwise never re-compacted,
+      # tightening the segment-size distribution and reclaiming space left by deletes/upserts. Runs at low
+      # priority (only when the compaction pipeline has spare capacity) and only emits plans that strictly
+      # reduce the segment count.
+      enable: false
+      # The under-fill pass groups under-filled segments into buckets whose total residual size targets
+      # groupFactor*maxSize before handing them to a single compaction task. Larger values pack more segments
+      # per task (better fill efficiency) at the cost of larger tasks. MUST be >= 2.
+      groupFactor: 8
     levelzero:
       triggerInterval: 10 # The time interval in seconds for trigger L0 compaction
       forceTrigger:
