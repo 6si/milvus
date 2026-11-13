@@ -267,3 +267,46 @@ func TestEstimateIndexLoadResourceReturnsErrorWithoutIndexType(t *testing.T) {
 	require.Error(t, err)
 	require.Zero(t, usage)
 }
+
+func TestBuildCLoadIndexInfoGpuHnswFallsBackToSegmentRows(t *testing.T) {
+	field := &schemapb.FieldSchema{
+		FieldID:  100,
+		Name:     "vec",
+		DataType: schemapb.DataType_FloatVector,
+		TypeParams: []*commonpb.KeyValuePair{
+			{Key: common.DimKey, Value: "128"},
+		},
+	}
+	segment := &querypb.SegmentLoadInfo{CollectionID: 1, PartitionID: 2, SegmentID: 3, NumOfRows: 1000}
+	newIndex := func(indexType string, numRows int64) *querypb.FieldIndexInfo {
+		return &querypb.FieldIndexInfo{
+			FieldID:   100,
+			IndexID:   10,
+			BuildID:   11,
+			IndexSize: 1024 * 1024,
+			NumRows:   numRows,
+			IndexParams: []*commonpb.KeyValuePair{
+				{Key: common.IndexTypeKey, Value: indexType},
+				{Key: common.MetricTypeKey, Value: "L2"},
+			},
+		}
+	}
+
+	for _, indexType := range []string{"GPU_HNSW", "GPU_HNSW_SQ"} {
+		// NumRows unset (0) or negative: fall back to the segment row count.
+		for _, indexRows := range []int64{0, -1} {
+			info, err := buildCLoadIndexInfo(field, segment, newIndex(indexType, indexRows))
+			require.NoError(t, err)
+			require.EqualValues(t, 1000, info.GetNumRows(), "%s indexRows=%d", indexType, indexRows)
+		}
+		// An index-reported row count always wins.
+		info, err := buildCLoadIndexInfo(field, segment, newIndex(indexType, 77))
+		require.NoError(t, err)
+		require.EqualValues(t, 77, info.GetNumRows())
+	}
+
+	// Non-GPU_HNSW indexes keep the index-reported count (zero stays zero).
+	info, err := buildCLoadIndexInfo(field, segment, newIndex("HNSW", 0))
+	require.NoError(t, err)
+	require.Zero(t, info.GetNumRows())
+}

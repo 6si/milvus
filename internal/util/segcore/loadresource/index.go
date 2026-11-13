@@ -144,15 +144,17 @@ func buildCLoadIndexInfo(field *schemapb.FieldSchema, segment *querypb.SegmentLo
 		}
 	}
 
-	// The FieldIndexInfo frequently omits the row count (it carries index
-	// metadata, not segment stats), which leaves NumRows==0 in the C load info.
-	// Knowhere's load-resource estimator multiplies rows*dim to size the
-	// transient host peak (notably the fp32-expanded GPU_HNSW upload), so a
-	// zero here collapses the estimate to ~file_size and lets the loader admit
-	// far too many concurrent uploads. Fall back to the segment's row count,
-	// which equals the indexed vector count for a sealed segment.
+	// For GPU_HNSW, FieldIndexInfo frequently omits the row count (it carries
+	// index metadata, not segment stats), which leaves NumRows==0 in the C load
+	// info. Knowhere's GPU_HNSW load-resource estimator multiplies rows*dim to
+	// size the transient host peak (the fp32-expanded upload), so a zero here
+	// collapses the estimate to ~file_size and lets the loader admit far too many
+	// concurrent uploads. Fall back to the segment's row count, which equals the
+	// indexed vector count for a sealed segment. Other index types keep the
+	// index-reported row count unchanged. index_type here is already the
+	// effective type: AppendPrepareLoadParams above applied override_index_type.
 	numRows := index.GetNumRows()
-	if numRows <= 0 {
+	if numRows <= 0 && isGpuHnswIndexType(indexParams[common.IndexTypeKey]) {
 		numRows = segment.GetNumOfRows()
 	}
 
@@ -173,6 +175,10 @@ func buildCLoadIndexInfo(field *schemapb.FieldSchema, segment *querypb.SegmentLo
 		CurrentScalarIndexVersion: index.GetCurrentScalarIndexVersion(),
 		IndexStorePathVersion:     index.GetIndexStorePathVersion(),
 	}, nil
+}
+
+func isGpuHnswIndexType(indexType string) bool {
+	return indexType == "GPU_HNSW" || indexType == "GPU_HNSW_SQ"
 }
 
 func isIndexMmapEnable(field *schemapb.FieldSchema, index *querypb.FieldIndexInfo) bool {
