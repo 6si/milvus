@@ -6,13 +6,26 @@ These tests validate GPU_HNSW functionality beyond parameter validation:
 2. Hot-load path — verify new segments load as GPU_HNSW while collection is loaded
 3. Restart resilience — verify segments reload as GPU_HNSW after querynode restart
 4. VRAM exhaustion — verify graceful handling when GPU memory is exceeded
-5. Mixed CPU/GPU mode — verify selective override (only HNSW_int8 on GPU)
+5. Mixed CPU/GPU mode — verify selective override (only HNSW_SQ on GPU)
 
 Requirements:
 - Milvus cluster with GPU querynode(s)
-- override_index_type config set in etcd:
-    knowhere.HNSW_int8.load.override_index_type: GPU_HNSW
 - pymilvus installed
+- load-stage override config (etcd or milvus.yaml / user.yaml). The override is keyed
+  by the *source* index type, and the two groups of tests need different configs:
+    * Recall / HotLoad / Restart / VramExhaustion (plain HNSW collections):
+        knowhere.HNSW.load.override_index_type: GPU_HNSW
+    * MixedMode (HNSW_SQ goes to GPU, plain HNSW must stay on CPU), so do NOT
+      override HNSW for this group:
+        knowhere.HNSW_SQ.load.override_index_type: GPU_HNSW_SQ
+  (An older revision of this file documented the SQ8 key as ``HNSW_int8``. That key
+  matches nothing on current Milvus and silently leaves the collection on CPU.)
+
+Optional strict check: these tests can only observe search results from a client, and a
+CPU HNSW load returns the same results as a GPU one. Set MILVUS_LOG=<path to the
+Milvus server log> to additionally assert the server really created the GPU index
+type (``create knowhere index GPU_HNSW`` / ``GPU_HNSW_SQ``). Without it the tests
+only validate correctness, not placement.
 
 Usage:
     pytest test_gpu_hnsw_e2e.py --host <milvus_host> --port 19530
@@ -21,6 +34,8 @@ Usage:
 """
 
 import logging
+import os
+import re
 import time
 
 import numpy as np
@@ -43,6 +58,45 @@ EF_SEARCH = 400
 M = 16
 RECALL_THRESHOLD = 0.95
 COLLECTION_PREFIX = "test_gpu_hnsw_e2e_"
+
+
+def count_server_log_matches(pattern):
+    """Count regex matches in the Milvus server log named by $MILVUS_LOG.
+
+    Returns None when MILVUS_LOG is unset or unreadable, so callers can skip the
+    placement check instead of failing in environments without log access.
+    """
+    path = os.environ.get("MILVUS_LOG")
+    if not path or not os.path.isfile(path):
+        return None
+    with open(path, errors="replace") as f:
+        return len(re.findall(pattern, f.read()))
+
+
+def assert_server_created(index_type, minimum=1):
+    """If MILVUS_LOG is set, assert knowhere created >= ``minimum`` ``index_type`` indexes.
+
+    Matches the knowhere factory line ``create knowhere index <index_type> with version``
+    so GPU_HNSW does not also match GPU_HNSW_SQ (and HNSW does not match HNSW_SQ).
+    """
+    n = count_server_log_matches(rf"to create knowhere index {re.escape(index_type)} with version")
+    if n is None:
+        log.info("MILVUS_LOG not set; skipping server-side placement check for %s", index_type)
+        return
+    assert n >= minimum, (
+        f"expected the server to create >= {minimum} {index_type} index(es) but the log shows {n}. "
+        f"The load-stage override_index_type config is probably not applied for this index type."
+    )
+
+
+def assert_server_not_created(index_type):
+    """If MILVUS_LOG is set, assert knowhere never created an ``index_type`` index."""
+    n = count_server_log_matches(rf"to create knowhere index {re.escape(index_type)} with version")
+    if n is None:
+        return
+    assert n == 0, (
+        f"server created {n} {index_type} index(es) but this config must leave that index type on CPU."
+    )
 
 
 def wait_load_complete(client, collection_name, timeout=120):
@@ -191,6 +245,7 @@ class TestGpuHnswRecall:
 
         # Wait for collection to be fully loaded
         wait_load_complete(self.client, self.collection_name)
+        assert_server_created("GPU_HNSW")  # no-op unless MILVUS_LOG is set
 
         # Search
         results = self.client.search(
@@ -611,8 +666,9 @@ class TestGpuHnswVramExhaustion:
 class TestGpuHnswMixedMode:
     """Test 5: Mixed CPU/GPU mode — selective override.
 
-    When only HNSW_int8 has override_index_type set (not HNSW), verify:
-    - HNSW_int8 (SQ8) collections load on GPU and produce correct results
+    When only HNSW_SQ has override_index_type set (HNSW_SQ -> GPU_HNSW_SQ; plain HNSW is
+    not overridden), verify:
+    - HNSW_SQ (SQ8) collections load on GPU and produce correct results
     - Plain HNSW (float32) collections stay on CPU and produce correct results
     - Both can coexist on the same querynode
     """
@@ -630,7 +686,7 @@ class TestGpuHnswMixedMode:
                 pass
 
     def test_int8_on_gpu_float_on_cpu(self):
-        """HNSW_int8 collection → GPU, plain HNSW collection → CPU.
+        """HNSW_SQ collection → GPU, plain HNSW collection → CPU.
 
         Both should produce correct search results. This tests that the
         override mechanism is selective (keyed by source index type).
@@ -654,7 +710,7 @@ class TestGpuHnswMixedMode:
         self.client.insert(self.collection_int8, rows)
         self.client.flush(self.collection_int8)
 
-        # HNSW_SQ with SQ8 → stored as HNSW_int8 internally
+        # HNSW_SQ with SQ8; the GPU override is keyed on the HNSW_SQ index type
         index_params = self.client.prepare_index_params()
         index_params.add_index(
             field_name="vector",
@@ -678,7 +734,7 @@ class TestGpuHnswMixedMode:
         self.client.insert(self.collection_float, rows2)
         self.client.flush(self.collection_float)
 
-        # Plain HNSW (float32) → no override if only HNSW_int8 is configured
+        # Plain HNSW (float32) → no override if only HNSW_SQ is configured
         index_params2 = self.client.prepare_index_params()
         index_params2.add_index(
             field_name="vector",
@@ -720,10 +776,16 @@ class TestGpuHnswMixedMode:
         recall_float = compute_recall(ids_float, ground_truth, TOP_K)
         log.info(f"Float32 collection (CPU) recall@{TOP_K}: {recall_float:.4f}")
 
+        # Placement (no-op unless MILVUS_LOG is set): the SQ8 collection must have been
+        # created as GPU_HNSW_SQ, and nothing may have been created as plain GPU_HNSW,
+        # i.e. the float HNSW collection stayed on CPU.
+        assert_server_created("GPU_HNSW_SQ")
+        assert_server_not_created("GPU_HNSW")
+
         # Both should achieve good recall
         assert recall_int8 >= RECALL_THRESHOLD, (
             f"INT8/GPU recall@{TOP_K} = {recall_int8:.4f}, expected >= {RECALL_THRESHOLD}. "
-            f"GPU override for HNSW_int8 may not be working."
+            f"GPU override for HNSW_SQ may not be working."
         )
         assert recall_float >= RECALL_THRESHOLD, (
             f"Float32/CPU recall@{TOP_K} = {recall_float:.4f}, expected >= {RECALL_THRESHOLD}. "
