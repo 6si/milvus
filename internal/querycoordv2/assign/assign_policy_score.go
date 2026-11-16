@@ -46,11 +46,13 @@ type ScoreBasedAssignPolicy struct {
 }
 
 type workloadStatus struct {
-	nodeGlobalRowCount        map[int64]int
-	nodeGlobalChannelRowCount map[int64]int
-	nodeGlobalChannels        map[int64][]*meta.DmChannel
-	nodeCollectionRowCount    map[int64]map[int64]int
-	nodeDelegatorCount        map[int64]map[int64]int
+	nodeGlobalRowCount         map[int64]int
+	nodeGlobalChannelRowCount  map[int64]int
+	nodeGlobalChannels         map[int64][]*meta.DmChannel
+	nodeCollectionRowCount     map[int64]map[int64]int
+	nodeDelegatorCount         map[int64]map[int64]int
+	nodeGlobalSegmentCount     map[int64]int
+	nodeCollectionSegmentCount map[int64]map[int64]int
 }
 
 // getWorkloadStatus refreshes and returns the workload status if the underlying distribution version has changed.
@@ -64,11 +66,13 @@ func (p *ScoreBasedAssignPolicy) getWorkloadStatus() *workloadStatus {
 	}
 
 	status := &workloadStatus{
-		nodeGlobalRowCount:        make(map[int64]int),
-		nodeGlobalChannelRowCount: make(map[int64]int),
-		nodeGlobalChannels:        make(map[int64][]*meta.DmChannel),
-		nodeCollectionRowCount:    make(map[int64]map[int64]int),
-		nodeDelegatorCount:        make(map[int64]map[int64]int),
+		nodeGlobalRowCount:         make(map[int64]int),
+		nodeGlobalChannelRowCount:  make(map[int64]int),
+		nodeGlobalChannels:         make(map[int64][]*meta.DmChannel),
+		nodeCollectionRowCount:     make(map[int64]map[int64]int),
+		nodeDelegatorCount:         make(map[int64]map[int64]int),
+		nodeGlobalSegmentCount:     make(map[int64]int),
+		nodeCollectionSegmentCount: make(map[int64]map[int64]int),
 	}
 
 	allSegments := p.dist.SegmentDistManager.GetByFilter()
@@ -79,6 +83,12 @@ func (p *ScoreBasedAssignPolicy) getWorkloadStatus() *workloadStatus {
 			status.nodeCollectionRowCount[s.Node] = make(map[int64]int)
 		}
 		status.nodeCollectionRowCount[s.Node][collectionID] += int(s.GetNumOfRows())
+
+		status.nodeGlobalSegmentCount[s.Node]++
+		if status.nodeCollectionSegmentCount[s.Node] == nil {
+			status.nodeCollectionSegmentCount[s.Node] = make(map[int64]int)
+		}
+		status.nodeCollectionSegmentCount[s.Node][collectionID]++
 	}
 
 	allChannels := p.dist.ChannelDistManager.GetByFilter()
@@ -293,14 +303,36 @@ func (p *ScoreBasedAssignPolicy) calculateScoreBySegment(
 	// Calculate executing task cost for collection
 	collectionRowCount := status.nodeCollectionRowCount[nodeID][collectionID] + delta.GetByNodeInCollection(nodeID)
 
-	// Final score: collection row count + global row count * factor
-	return collectionRowCount + int(float64(nodeRowCount)*
-		params.Params.QueryCoordCfg.GlobalRowCountFactor.GetAsFloat())
+	globalRowCountFactor := params.Params.QueryCoordCfg.GlobalRowCountFactor.GetAsFloat()
+
+	// Base score: collection row count + global row count * factor
+	score := collectionRowCount + int(float64(nodeRowCount)*globalRowCountFactor)
+
+	// Optionally fold segment count into the score so the balancer equalizes
+	// segment count (not only rows/memory). Mirrors the row-count term: each
+	// segment counts as segmentCountFactor "rows", weighted collection-locally
+	// and globally by the same globalRowCountFactor. Disabled when factor is 0.
+	if segmentCountFactor := params.Params.QueryCoordCfg.ScoreBasedBalanceSegmentCountFactor.GetAsFloat(); segmentCountFactor > 0 {
+		collectionSegmentCount := status.nodeCollectionSegmentCount[nodeID][collectionID]
+		globalSegmentCount := status.nodeGlobalSegmentCount[nodeID]
+		score += int(segmentCountFactor * (float64(collectionSegmentCount) + float64(globalSegmentCount)*globalRowCountFactor))
+	}
+
+	return score
 }
 
 // calculateSegmentScore calculates the score of a segment
 func (p *ScoreBasedAssignPolicy) CalculateSegmentScore(s *meta.Segment) float64 {
-	return float64(s.GetNumOfRows()) * (1 + params.Params.QueryCoordCfg.GlobalRowCountFactor.GetAsFloat())
+	globalRowCountFactor := params.Params.QueryCoordCfg.GlobalRowCountFactor.GetAsFloat()
+	score := float64(s.GetNumOfRows()) * (1 + globalRowCountFactor)
+	// Each segment adds a fixed per-segment cost so that moving a segment also
+	// rebalances segment count. Consistent with calculateScoreBySegment, where a
+	// segment contributes segmentCountFactor*(1+globalRowCountFactor) to a node's
+	// score. Disabled (no change) when the factor is 0.
+	if segmentCountFactor := params.Params.QueryCoordCfg.ScoreBasedBalanceSegmentCountFactor.GetAsFloat(); segmentCountFactor > 0 {
+		score += segmentCountFactor * (1 + globalRowCountFactor)
+	}
+	return score
 }
 
 // AssignChannel assigns channels to nodes using score-based strategy

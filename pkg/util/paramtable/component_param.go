@@ -3681,6 +3681,7 @@ type queryCoordConfig struct {
 	Balancer                            ParamItem `refreshable:"true"`
 	BalanceTriggerOrder                 ParamItem `refreshable:"true"`
 	GlobalRowCountFactor                ParamItem `refreshable:"true"`
+	ScoreBasedBalanceSegmentCountFactor ParamItem `refreshable:"true"`
 	ScoreUnbalanceTolerationFactor      ParamItem `refreshable:"true"`
 	ReverseUnbalanceTolerationFactor    ParamItem `refreshable:"true"`
 	OverloadedMemoryThresholdPercentage ParamItem `refreshable:"true"`
@@ -3868,6 +3869,19 @@ If this parameter is set false, Milvus simply searches the growing segments with
 		Export:       true,
 	}
 	p.GlobalRowCountFactor.Init(base.mgr)
+
+	p.ScoreBasedBalanceSegmentCountFactor = ParamItem{
+		Key:          "queryCoord.scoreBasedBalanceSegmentCountFactor",
+		Version:      "2.6.19",
+		DefaultValue: "0",
+		PanicIfEmpty: false,
+		Doc: `The per-segment weight (in row-count-equivalent units) added to the score-based balancer's node score.
+The default score-based balancer equalizes only row count / memory per node, so nodes can end up with equal rows
+but very different segment counts after scale-out. Set this above 0 to also equalize segment count: each segment
+contributes this many "rows" to a node's balance score. 0 (default) preserves the existing row-only behavior.`,
+		Export: true,
+	}
+	p.ScoreBasedBalanceSegmentCountFactor.Init(base.mgr)
 
 	p.RowCountFactor = ParamItem{
 		Key:          "queryCoord.rowCountFactor",
